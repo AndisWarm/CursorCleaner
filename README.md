@@ -135,14 +135,6 @@ python cursor_cleaner.py --db "D:\\test\\state.vscdb" --op preview
 %APPDATA%\Cursor\User\globalStorage\conversation-search.db
 ```
 
-## 安全注意事项
-
-1. 删除会话前请确认 Cursor 已完全退出。
-2. 删除操作具有破坏性，请先使用备份功能。
-3. 不要把 `state.vscdb`、`conversation-search.db`、数据库备份或聊天记录提交到 GitHub。
-4. 公共仓库中不要提交 API Key、Token、密码和 `.env` 文件。
-5. 建议先使用 GitHub Private 仓库，确认没有隐私数据后再公开。
-
 ## 项目结构
 
 ```text
