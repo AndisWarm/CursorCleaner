@@ -4,6 +4,8 @@
 
 它会读取 Cursor 的本地会话数据库，帮助你查看、备份和清理无用会话数据。聊天记录和数据库内容只在本机处理，不会上传到网络。
 
+工具会同时检查 `globalStorage` 和 `workspaceStorage` 下的 `state.vscdb`。这样使用 Cursor 账号登录时，存放在工作区数据库中的会话也能被发现和查看；旧版/API key 场景使用的全局数据库仍保持兼容。
+
 ## 功能
 
 - 扫描并分类 Cursor 会话
@@ -14,6 +16,9 @@
 - 备份和恢复 Cursor 会话数据库
 - 清理会话搜索索引 `conversation-search.db`
 - 支持通过 `--db` 指定测试数据库
+- 自动隐藏同一账号会话产生的空草稿/占位副本，优先保留有正文的记录
+- 自动检测 Cursor 外部归档/取消归档状态，默认每 2 秒刷新一次；也可按 `R` 手动刷新
+- 聊天记录中的 UTC 时间会转换为当前机器本地时间显示
 - 防止打开聊天记录后重复按 `v` 导致页面重复堆叠
 
 ## 会话状态
@@ -73,6 +78,8 @@ python cursor_cleaner.py
 start_cursor_cleaner.bat
 ```
 
+启动窗口会显示实际执行的 `cursor_cleaner.py` 路径和修改时间，避免误运行其它目录中的旧副本。
+
 ### TUI 快捷键
 
 | 按键 | 功能 |
@@ -83,6 +90,7 @@ start_cursor_cleaner.bat
 | `V` | 查看当前会话聊天记录 |
 | `D` | 删除勾选的会话 |
 | `B` | 备份数据库 |
+| `R` | 立即刷新会话列表 |
 | `Q` | 退出工具 |
 | `Q` / `Esc` | 在聊天记录页面返回 |
 
@@ -115,7 +123,7 @@ purge-index     清理 conversation-search.db
 python cursor_cleaner.py --op delete-archived --yes --force
 ```
 
-指定数据库路径进行测试：
+指定数据库路径进行测试（指定后只读取该文件，不再自动扫描 workspaceStorage）：
 
 ```bash
 python cursor_cleaner.py --db "D:\\test\\state.vscdb" --op preview
@@ -127,6 +135,12 @@ python cursor_cleaner.py --db "D:\\test\\state.vscdb" --op preview
 
 ```text
 %APPDATA%\Cursor\User\globalStorage\state.vscdb
+```
+
+另外会自动扫描：
+
+```text
+%APPDATA%\Cursor\User\workspaceStorage\*\state.vscdb
 ```
 
 会话搜索索引默认位于：
