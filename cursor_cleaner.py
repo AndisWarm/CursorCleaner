@@ -1437,6 +1437,26 @@ def fmt_conversation_markdown(cid: str, name: str = "",
     return "\n".join(lines)
 
 
+def _sanitize_filename(name: str) -> str:
+    """清洗为 Windows 合法文件名片段：非法字符替换为 _，去首尾空格/点。"""
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    return cleaned[:60] or "会话"
+
+
+def export_conversation_md(cid: str, name: str, msgs: List[dict], out_path: str) -> str:
+    """把会话导出为 Markdown 文件，返回最终绝对路径。
+
+    out_path 为相对路径时基于当前工作目录；父目录不存在会自动创建。
+    """
+    target = os.path.abspath(out_path)
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(fmt_conversation_markdown(cid, name, msgs))
+    return target
+
+
 def remove_keys_for(con: sqlite3.Connection, cid: str) -> int:
     """删除一个会话的所有正文键，返回删除行数。"""
     if not _table_exists(con, "cursorDiskKV"):
@@ -2523,11 +2543,11 @@ def _tui_imports():
         from textual.message import Message
         from textual.screen import ModalScreen, Screen
         from textual.scroll_view import ScrollView
-        from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Label, Static
+        from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, Static
         from textual.worker import Worker, WorkerState
         return (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
                 Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
-                Button, Checkbox, DataTable, Footer, Header, Label, Static,
+                Button, Checkbox, DataTable, Footer, Header, Input, Label, Static,
                 on, Worker, WorkerState)
     except ImportError:
         return None
@@ -2550,7 +2570,7 @@ TUI_APP_CLASS = None  # 测试可引用
 def _build_app_class(mods):
     (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
      Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
-     Button, Checkbox, DataTable, Footer, Header, Label, Static,
+     Button, Checkbox, DataTable, Footer, Header, Input, Label, Static,
      on, Worker, WorkerState) = mods
 
     STATUS_LABEL = {
@@ -2610,6 +2630,35 @@ def _build_app_class(mods):
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
             self.dismiss(event.button.id == "btn-yes")
+
+    class ExportModal(ModalScreen[Optional[str]]):
+        """导出路径输入弹窗：Enter 确认返回路径，Esc 取消返回 None。
+
+        Esc 必须走 BINDINGS（命中即消费事件）；key_escape 方法不会阻止
+        事件传播，dismiss 后同一个 Esc 会继续命中 ChatScreen 的
+        escape→close，把聊天页一起关掉。
+        """
+
+        BINDINGS = [Binding("escape", "cancel", "", show=False)]
+
+        def __init__(self, default_path: str):
+            super().__init__()
+            self._default_path = default_path
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="export-box"):
+                yield Label("导出为 Markdown（Enter 确认，Esc 取消）：", id="export-text")
+                yield Input(value=self._default_path, id="export-input")
+
+        def on_mount(self) -> None:
+            self.query_one("#export-input", Input).focus()
+
+        def on_input_submitted(self, event: "Input.Submitted") -> None:
+            value = event.value.strip()
+            self.dismiss(value or None)
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
 
     class CleanupScreen(Screen[None]):
         """磁盘清理面板：列出可清理类目与占用，勾选后执行。
@@ -3000,6 +3049,10 @@ def _build_app_class(mods):
             # ChatScreen 打开后，v 不应再冒泡到 CleanerApp，避免重复
             # push_screen 导致同一条记录被层层打开、返回次数增加。
             Binding("v", "ignore_view_chat", "", show=False),
+            Binding("c", "copy_selection", "复制选中"),
+            # Screen 级 ctrl+c 优先于 App 的 help_quit，仅本页生效
+            Binding("ctrl+c", "copy_selection", "", show=False),
+            Binding("e", "export_md", "导出md"),
             Binding("escape", "close", "返回"),
             Binding("q", "close", "返回"),
         ]
@@ -3048,7 +3101,7 @@ def _build_app_class(mods):
                 yield UserIndexRail(self._user_msgs, id="user-rail")
             yield Static(id="user-preview")
             yield Static(
-                f"[q/esc]返回  ↑↓/PgUp/PgDn滚动  悬停圆点查看/滚轮滚动圆点链 — {self._title}",
+                f"[[q/esc]返回  [[c]复制选中  [[e]导出md  ↑↓/PgUp/PgDn滚动  悬停圆点查看/滚轮滚动圆点链 — {_md_escape(self._title)}",
                 id="chat-footer",
             )
 
@@ -3126,6 +3179,37 @@ def _build_app_class(mods):
         def action_close(self) -> None:
             self.app.pop_screen()
 
+        def action_copy_selection(self) -> None:
+            """复制鼠标拖选高亮的文本到系统剪贴板（Win32 API，不依赖终端 OSC52）。"""
+            text = self.get_selected_text()
+            if not text:
+                self.notify("先用鼠标拖选要复制的文本，再按 c", timeout=3)
+                return
+            if _copy_to_clipboard(text):
+                self.notify(f"已复制 {len(text)} 个字符", timeout=3)
+            else:
+                self.notify("复制失败：剪贴板不可用", severity="error", timeout=3)
+
+        def action_export_md(self) -> None:
+            """弹出路径输入框，把当前会话导出为 Markdown 文件。"""
+            default = os.path.join(
+                "exports",
+                f"{_sanitize_filename(self._title)}-{time.strftime('%Y%m%d-%H%M%S')}.md",
+            )
+
+            def _do_export(path: Optional[str]) -> None:
+                if not path:
+                    self.notify("已取消导出", timeout=2)
+                    return
+                try:
+                    out = export_conversation_md("", self._title, self._msgs, path)
+                except OSError as e:
+                    self.notify(f"导出失败: {e}", severity="error", timeout=5)
+                    return
+                self.notify(f"已导出: {out}", timeout=8)
+
+            self.app.push_screen(ExportModal(default), _do_export)
+
         def action_ignore_view_chat(self) -> None:
             """聊天记录已打开时忽略重复的 v 操作。"""
             return
@@ -3157,6 +3241,9 @@ def _build_app_class(mods):
         #confirm-text { text-align: center; margin-bottom: 1; }
         #confirm-btns { align: center middle; }
         #confirm-btns Button { margin: 0 1; }
+        #export-box { width: 76; height: auto; padding: 1 2; border: thick $accent;
+                     background: $surface; content-align: center middle; }
+        #export-text { margin-bottom: 1; }
         #chat-footer { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
         """
 
