@@ -1096,9 +1096,25 @@ def _tool_summary(t: dict) -> dict:
     return {"name": name, "status": status, "detail": (detail or "")[:300]}
 
 
-def fmt_conversation_markdown(cid: str, name: str = "") -> str:
-    """把会话聊天记录渲染为 Markdown 文本（供 TUI 展示）。"""
-    msgs = fetch_conversation(cid)
+def _user_message_summary(m: dict) -> str:
+    """用户消息的简略摘要：取正文首行截断；无正文时退回工具名。"""
+    text = (m.get("text") or "").strip()
+    if text:
+        first = text.splitlines()[0].strip()
+        return first[:80] + "…" if len(first) > 80 else first
+    for tool in m.get("tools") or []:
+        return f"🔧 {tool['name']}"
+    return "（无正文）"
+
+
+def fmt_conversation_markdown(cid: str, name: str = "",
+                              msgs: Optional[List[dict]] = None) -> str:
+    """把会话聊天记录渲染为 Markdown 文本（供 TUI 展示）。
+
+    msgs 可传入已拉取的消息列表，避免调用方重复读取数据库。
+    """
+    if msgs is None:
+        msgs = fetch_conversation(cid)
     if not msgs:
         return f"# {name or cid}\n\n_（无聊天记录或已无正文数据）_"
     lines = [f"# {name or cid}", f"共 {len(msgs)} 条消息\n"]
@@ -1573,13 +1589,18 @@ def _db_fingerprint() -> Tuple[Tuple[str, float, int], ...]:
 def _tui_imports():
     try:
         from textual import on
-        from textual.app import App, ComposeResult
+        from textual.app import App, ComposeResult, RenderResult
         from textual.binding import Binding
         from textual.containers import Horizontal, Vertical
+        from textual.events import Click, Leave, MouseMove
+        from textual.geometry import Offset, Size
+        from textual.message import Message
         from textual.screen import ModalScreen, Screen
+        from textual.scroll_view import ScrollView
         from textual.widgets import Button, DataTable, Footer, Header, Label, MarkdownViewer, Static
         from textual.worker import Worker, WorkerState
-        return (App, ComposeResult, Binding, Horizontal, Vertical, ModalScreen, Screen,
+        return (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical,
+                Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
                 Button, DataTable, Footer, Header, Label, MarkdownViewer, Static,
                 on, Worker, WorkerState)
     except ImportError:
@@ -1601,7 +1622,8 @@ TUI_APP_CLASS = None  # 测试可引用
 
 
 def _build_app_class(mods):
-    (App, ComposeResult, Binding, Horizontal, Vertical, ModalScreen, Screen,
+    (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical,
+     Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
      Button, DataTable, Footer, Header, Label, MarkdownViewer, Static,
      on, Worker, WorkerState) = mods
 
@@ -1611,6 +1633,22 @@ def _build_app_class(mods):
         S_MIRROR_ONLY: "残留",
         S_CONTENT_ONLY: "孤儿",
     }
+
+    class UserDotHovered(Message):
+        """鼠标悬停到索引圆点上。index=-1 表示离开轨道。"""
+
+        def __init__(self, index: int, screen_x: float = 0, screen_y: float = 0) -> None:
+            super().__init__()
+            self.index = index
+            self.screen_x = screen_x
+            self.screen_y = screen_y
+
+    class UserDotSelected(Message):
+        """点击索引圆点，请求跳到对应用户消息。"""
+
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
 
     class ConfirmModal(ModalScreen[bool]):
         """删除前确认弹窗。"""
@@ -1629,8 +1667,86 @@ def _build_app_class(mods):
         def on_button_pressed(self, event: Button.Pressed) -> None:
             self.dismiss(event.button.id == "btn-yes")
 
+    class UserIndexRail(ScrollView):
+        """右侧用户输入索引轨道：圆点 + 虚线连接，可独立滚动。
+
+        每条用户消息一个圆点，消息之间以竖虚线相连；悬停圆点弹出
+        信息面板（ChatScreen 负责），点击圆点跳转到正文对应位置。
+
+        继承 ScrollView 做线渲染（render() 返回文本），不挂子组件，
+        避免容器布局/子组件更新在渲染管线中触发竞态。
+        """
+
+        DEFAULT_CSS = """
+        UserIndexRail {
+            width: 3;
+            scrollbar-size-vertical: 0;
+            background: $surface;
+        }
+        """
+
+        def __init__(self, user_msgs: List[Tuple[str, str]], **kwargs):
+            super().__init__(**kwargs)
+            self._user_msgs = user_msgs
+            self._hovered = -1   # 悬停圆点行号
+            self._current = -1   # 视口内高亮圆点行号
+            n = len(user_msgs)
+            # 每行 1 个圆点或虚线，内容宽 3（无边框，圆点右对齐贴滚动条）
+            self.virtual_size = Size(3, n * 2 - 1 if n else 1)
+
+        def render(self) -> RenderResult:
+            lines: List[str] = []
+            n = len(self._user_msgs)
+            for i in range(n):
+                if i == self._hovered:
+                    dot = "[b $accent reverse]●[/]"
+                elif i == self._current:
+                    dot = "[b $primary]●[/]"
+                else:
+                    dot = "●"
+                lines.append(f"  {dot}")
+                if i < n - 1:
+                    lines.append("  ┆")
+            return "\n".join(lines)
+
+        def set_current(self, index: int) -> None:
+            """由 ChatScreen 在正文滚动时调用，高亮视口内圆点。"""
+            if index != self._current:
+                self._current = index
+                self.refresh()
+
+        def _dot_index_at(self, y: float) -> int:
+            # 鼠标坐标相对本组件 region（无边框，内容区从 y=0 开始）；
+            # 圆点行占 1 行、虚线行占 1 行，轮流排列。
+            line = int(y) + int(self.scroll_y)
+            if line < 0 or line % 2 != 0:
+                return -1
+            i = line // 2
+            return i if 0 <= i < len(self._user_msgs) else -1
+
+        def _set_hover(self, index: int, screen_x: float = 0, screen_y: float = 0) -> None:
+            if index != self._hovered:
+                self._hovered = index
+                self.refresh()
+                self.post_message(UserDotHovered(index, screen_x, screen_y))
+
+        def on_mouse_move(self, event: MouseMove) -> None:
+            self._set_hover(self._dot_index_at(event.y), event.screen_x, event.screen_y)
+
+        def on_leave(self, event: Leave) -> None:
+            self._set_hover(-1)
+
+        def on_click(self, event: Click) -> None:
+            i = self._dot_index_at(event.y)
+            if i >= 0:
+                self.post_message(UserDotSelected(i))
+
     class ChatScreen(Screen[None]):
-        """会话聊天记录查看器（全屏，可滚动）。"""
+        """会话聊天记录查看器（全屏，可滚动）。
+
+        右侧带用户输入索引轨道：圆点索引每条用户消息，悬停查看
+        简略信息，点击跳转到正文对应位置；正文滚动时高亮当前圆点。
+        """
 
         BINDINGS = [
             # ChatScreen 打开后，v 不应再冒泡到 CleanerApp，避免重复
@@ -1640,27 +1756,175 @@ def _build_app_class(mods):
             Binding("q", "close", "返回"),
         ]
 
-        def __init__(self, title: str, markdown: str):
+        CSS = """
+        #chat-body { height: 1fr; }
+        #chat-md { height: 1fr; padding: 0 4 0 1; }
+        #user-rail {
+            position: absolute;
+            layer: overlay;
+            width: 3;
+            scrollbar-size-vertical: 0;
+            background: $surface;
+        }
+        #user-preview {
+            display: none;
+            position: absolute;
+            layer: overlay;
+            border: round $primary;
+            background: $panel;
+            padding: 0 1;
+            height: auto;
+            color: $text;
+        }
+        #chat-footer { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
+        """
+
+        def __init__(self, title: str, markdown: str, user_msgs: List[Tuple[str, str]]):
             super().__init__()
             self._title = title
             self._markdown = markdown
+            self._user_msgs = user_msgs
+            self._user_blocks: List[Any] = []   # 正文中用户消息标题块
+            self._last_highlight = -1
+            self._collect_retries = 0
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             # Markdown 只是渲染组件，不负责滚动；MarkdownViewer 继承
             # VerticalScroll，支持 PgUp/PgDn、方向键和鼠标滚轮。
-            yield MarkdownViewer(
-                self._markdown,
-                show_table_of_contents=False,
-                id="chat-md",
+            with Horizontal(id="chat-body"):
+                yield MarkdownViewer(
+                    self._markdown,
+                    show_table_of_contents=False,
+                    id="chat-md",
+                )
+            # 索引轨道与信息面板都是绝对定位覆盖层，位置由
+            # absolute_offset 动态指定（_place_rail / _update_preview）。
+            if self._user_msgs:
+                yield UserIndexRail(self._user_msgs, id="user-rail")
+            yield Static(id="user-preview")
+            yield Static(
+                f"[q/esc]返回  ↑↓/PgUp/PgDn滚动  悬停圆点查看/滚轮滚动圆点链 — {self._title}",
+                id="chat-footer",
             )
-            yield Static(f"[q/esc]返回  ↑↓/PgUp/PgDn滚动 — {self._title}", id="chat-footer")
 
         def on_mount(self) -> None:
             # MarkdownViewer 的滚动键绑定在外层，实际焦点放在其文档上，
             # 这样 PgUp/PgDn 会沿 DOM 冒泡到 MarkdownViewer 处理。
-            viewer = self.query_one("#chat-md", MarkdownViewer)
-            viewer.document.focus()
+            self._viewer = self.query_one("#chat-md", MarkdownViewer)
+            self._viewer.document.focus()
+            self._rail = self.query_one("#user-rail", UserIndexRail)
+            self._preview = self.query_one("#user-preview", Static)
+            # 轨道绝对定位在滚动条左侧；首次布局完成后再定位，
+            # resize 时重算（此时 viewer 的 scrollable_content_region
+            # 才有效）。
+            self.call_after_refresh(self._place_rail)
+            # document.update 是异步的，等下一帧再收集用户消息标题块。
+            self.call_after_refresh(self._collect_user_blocks)
+            self._highlight_timer = self.set_interval(0.15, self._update_highlight)
+
+        def on_resize(self) -> None:
+            self._place_rail()
+
+        def _place_rail(self) -> None:
+            """把索引轨道放在 viewer 滚动条左侧，高度封顶 3/4 屏。
+
+            Textual 的 absolute 覆盖层用 widget.absolute_offset 指定
+            屏幕坐标（styles.left/top 不生效）。轨道右缘对齐滚动条
+            左缘（scrollable_content_region.right）；轨道高度 = min(内容
+            高度, 3/4 内容区高)，圆点多时锁定视口，悬停轨道滚轮即可
+            滚动圆点链（ScrollView 原生滚轮处理）。
+            """
+            if not hasattr(self, "_viewer") or not hasattr(self, "_rail"):
+                return  # resize 事件可能先于 on_mount 的组件查询到达
+            content = self._viewer.scrollable_content_region
+            if content.height <= 0:
+                return
+            self._rail.absolute_offset = Offset(content.right - 3, content.y)
+            rail_h = min(self._rail.virtual_size.height, max(3, content.height * 3 // 4))
+            if self._rail.styles.height != rail_h:
+                self._rail.styles.height = rail_h
+            self._rail.styles.refresh(layout=True)
+
+        def _collect_user_blocks(self) -> None:
+            """收集正文里渲染为 ## 用户 ... 的标题块，与 user_msgs 一一对应。
+
+            MarkdownIt 的 heading token 自身不含文本（content 为空），
+            标题文字在渲染后的 Content 里，因此用 _content.plain 判断。
+            """
+            blocks = []
+            for child in self._viewer.document.children:
+                token = getattr(child, "_token", None)
+                tag = getattr(token, "tag", "") if token is not None else ""
+                plain = getattr(child._content, "plain", "") if hasattr(child, "_content") else ""
+                if tag == "h2" and str(plain or "").startswith("用户"):
+                    blocks.append(child)
+            self._user_blocks = blocks
+            if len(blocks) < len(self._user_msgs) and self._collect_retries < 5:
+                self._collect_retries += 1
+                self.set_timer(0.25, self._collect_user_blocks)
+            else:
+                self._update_highlight()
+
+        def _update_highlight(self) -> None:
+            """按正文滚动位置刷新轨道中高亮圆点（视口内第一条用户消息）。
+
+            block.region 是相对屏幕的坐标，随滚动偏移变化；用
+            viewer 内容区（屏幕坐标）与块区域比较判断是否在视口内。
+            """
+            if not self._user_blocks:
+                # 块尚未收集完成；收集完成时会主动调用本方法，这里直接
+                # 返回，避免与 _collect_user_blocks 互相递归。
+                return
+            top = self._viewer.content_region.y
+            bottom = top + self._viewer.scrollable_content_region.height
+            idx = -1
+            for i, b in enumerate(self._user_blocks):
+                if b.region.y >= top and b.region.y < bottom:
+                    idx = i
+                    break
+            if idx < 0:
+                # 视口内没有块顶（块间距较大时），取最后进入视口的块。
+                for i, b in enumerate(self._user_blocks):
+                    if b.region.bottom > top:
+                        idx = i
+            if idx != self._last_highlight:
+                self._last_highlight = idx
+                self._rail.set_current(idx)
+
+        def on_user_dot_hovered(self, event: UserDotHovered) -> None:
+            event.stop()
+            self._update_preview(event.index, event.screen_x, event.screen_y)
+
+        def on_user_dot_selected(self, event: UserDotSelected) -> None:
+            event.stop()
+            i = event.index
+            if 0 <= i < len(self._user_blocks):
+                self._viewer.scroll_to_widget(self._user_blocks[i], top=True)
+
+        def _update_preview(self, index: int, screen_x: float = 0, screen_y: float = 0) -> None:
+            """在鼠标附近显示简略信息面板，防止超出屏幕。"""
+            if index < 0 or index >= len(self._user_msgs):
+                self._preview.display = False
+                return
+            ts, summary = self._user_msgs[index]
+            self._preview.update(f"[b]{ts}[/b]\n{summary}")
+            panel_w = min(int(self.size.width * 0.45), 70)
+            est_h = 3 + (len(summary) + 59) // 60
+            # 默认在鼠标右侧；放不下则移到左侧。
+            left = int(screen_x) + 1
+            if left + panel_w >= self.size.width:
+                left = int(screen_x) - panel_w - 1
+            # 默认在鼠标下方；超出下缘则移到上方。
+            top = int(screen_y) + 1
+            if top + est_h >= self.size.height:
+                top = int(screen_y) - est_h - 1
+            left = max(1, left)
+            top = max(1, top)
+            self._preview.styles.width = panel_w
+            self._preview.absolute_offset = Offset(left, top)
+            self._preview.styles.refresh(layout=True)
+            self._preview.display = True
 
         def action_close(self) -> None:
             self.app.pop_screen()
@@ -1975,10 +2239,17 @@ def _build_app_class(mods):
             sess = next((s for s in self.sessions if s.composer_id == cid), None)
             title = sess.display_name if sess else cid
 
-            def _generate() -> str:
+            def _generate() -> "Tuple[str, List[Tuple[str, str]]]":
                 # 数据层在 worker 线程内新建 sqlite3 连接，主线程不参与，
                 # 线程安全；生成过程不再阻塞事件循环。
-                return fmt_conversation_markdown(cid, title)
+                msgs = fetch_conversation(cid)
+                md = fmt_conversation_markdown(cid, title, msgs=msgs)
+                user_msgs = [
+                    (fmt_message_ts(m.get("time")), _user_message_summary(m))
+                    for m in msgs
+                    if m.get("type") == 1
+                ]
+                return md, user_msgs
 
             self._chat_worker = self.run_worker(_generate, thread=True, exit_on_error=False)
             self._chat_title = title
@@ -1995,7 +2266,8 @@ def _build_app_class(mods):
                 self._chat_worker = None
                 self._chat_title = None
                 if self.screen is not None:
-                    self.push_screen(ChatScreen(title, worker.result or ""))
+                    md, user_msgs = worker.result or ("", [])
+                    self.push_screen(ChatScreen(title, md, user_msgs))
             elif event.state == WorkerState.ERROR:
                 worker = self._chat_worker
                 self._chat_worker = None
