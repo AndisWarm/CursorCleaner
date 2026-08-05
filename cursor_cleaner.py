@@ -601,8 +601,13 @@ def _deduplicate_sessions(sessions: List[Session]) -> List[Session]:
 
     Cursor 账号登录后可能同时留下一个可读的 composer 和一个只有
     composerData 的 draft/placeholder。两者通常拥有相同标题与工作区，
-    但后者没有任何消息正文。归档、镜像残留和正文孤儿仍保留，便于
-    清理；只对未归档的空副本做去重。
+    但后者没有任何消息正文。隐藏规则分两条：
+
+    1. 同名同工作区的组内存在有正文会话时，隐藏组内无正文的副本；
+    2. 无消息正文且属于草稿 / 子 agent / 无标题占位的记录一律隐藏——
+       因此只剩 checkpointId 等键的无名正文孤儿也不在默认列表中显示。
+       隐藏不等于豁免清理：delete-archived 走 include_hidden 模式，
+       这些记录仍会被正常删除。
     """
     named_groups: Dict[Tuple[str, str], List[Session]] = {}
     for session in sessions:
@@ -1129,6 +1134,9 @@ def _inline_md():
         from markdown_it import MarkdownIt
 
         _INLINE_MD = MarkdownIt("commonmark", {"html": False, "breaks": False, "linkify": False})
+        # commonmark preset 不启用 strikethrough，而 _tokens_to_text 渲染
+        # s_open/s_close；不开启该规则则删除线分支永远不会触发。
+        _INLINE_MD.enable("strikethrough")
     return _INLINE_MD
 
 
@@ -1290,6 +1298,12 @@ def _parse_inline_md(line: str) -> str:
     """
     md = _inline_md()
     tokens = md.parseInline(line)
+    # parseInline 返回 [Token(inline, children=[...])]，行内 token 在
+    # children 里；直接遍历外层会让 inline token 落入兜底分支返回原文，
+    # 粗体/行内代码等样式永远不生效。
+    for tok in tokens:
+        if tok.type == "inline" and tok.children is not None:
+            return _tokens_to_text(tok.children)
     return _tokens_to_text(tokens)
 
 
@@ -2267,8 +2281,9 @@ def _list_backup_files() -> List[str]:
 
 
 def _list_search_indexes() -> List[str]:
-    """globalStorage 与各 workspace 下的会话搜索索引。"""
-    paths = [SEARCH_INDEX] + [
+    """globalStorage 与各 workspace 下的会话搜索索引（仅存在的文件）。"""
+    paths = [SEARCH_INDEX] if os.path.isfile(SEARCH_INDEX) else []
+    paths += [
         f for f in glob.glob(os.path.join(WORKSPACE_STORAGE, "*", "conversation-search.db"))
         if os.path.isfile(f)
     ]
