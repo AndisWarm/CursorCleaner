@@ -276,6 +276,22 @@ def cursor_running() -> bool:
         return False
 
 
+_cursor_running_cache: Tuple[float, bool] = (0.0, False)
+
+
+def cursor_running_cached(ttl: float = 5.0) -> bool:
+    """带 TTL 缓存的 Cursor 运行检测，避免高频 UI 刷新时反复 spawn 子进程。
+
+    TUI 状态栏/勾选等展示用途使用；删除、恢复等写操作前的安全检查
+    仍调用无缓存的 cursor_running()，不做任何行为回退。
+    """
+    global _cursor_running_cache
+    now = time.monotonic()
+    if now - _cursor_running_cache[0] >= ttl:
+        _cursor_running_cache = (now, cursor_running())
+    return _cursor_running_cache[1]
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -487,25 +503,28 @@ def _key_identifier(key: str, prefix: str) -> str:
 
 
 def _scan_content_db(con: sqlite3.Connection) -> Tuple[Dict[str, int], Dict[str, List[Any]]]:
-    """扫描一个 DB 的正文键，返回 composerId -> 键数和 composerData。"""
+    """扫描一个 DB 的正文键，返回 composerId -> 键数和 composerData。
+
+    列表阶段只读键名（短字符串），不拉取 cursorDiskKV 的大 blob；
+    composerData 的值单独按 key 精确读取，用于解析消息头。
+    """
     if not _table_exists(con, "cursorDiskKV"):
         return {}, {}
     try:
-        rows = con.execute("SELECT key, value FROM cursorDiskKV").fetchall()
+        keys = [str(key) for (key,) in con.execute("SELECT key FROM cursorDiskKV")]
     except sqlite3.DatabaseError:
         return {}, {}
 
     counts: Dict[str, int] = {}
-    composer_data: Dict[str, List[Any]] = {}
+    composer_data_keys: Dict[str, List[str]] = {}
     unscoped_bubbles: Dict[str, int] = {}
 
-    for key, value in rows:
-        key = str(key)
+    for key in keys:
         if key.startswith("composerData:"):
             cid = _key_identifier(key, "composerData:")
             if cid:
                 counts[cid] = counts.get(cid, 0) + 1
-                composer_data.setdefault(cid, []).append(_decode_json(value))
+                composer_data_keys.setdefault(cid, []).append(key)
             continue
 
         if key.startswith(("composerVirtualRowHeights:", "checkpointId:", "ofsContent:")):
@@ -526,6 +545,19 @@ def _scan_content_db(con: sqlite3.Connection) -> Tuple[Dict[str, int], Dict[str,
                 # fullConversationHeadersOnly 反向关联 composerId。
                 bid = parts[1]
                 unscoped_bubbles[bid] = unscoped_bubbles.get(bid, 0) + 1
+
+    composer_data: Dict[str, List[Any]] = {}
+    if composer_data_keys:
+        try:
+            for cid, key_list in composer_data_keys.items():
+                placeholders = ",".join("?" * len(key_list))
+                rows = con.execute(
+                    f"SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})",
+                    key_list,
+                ).fetchall()
+                composer_data[cid] = [_decode_json(value) for _, value in rows]
+        except sqlite3.DatabaseError:
+            pass
 
     for cid, payloads in composer_data.items():
         for payload in payloads:
@@ -736,13 +768,38 @@ def count_keys_for(con: sqlite3.Connection, cid: str) -> int:
     return int(cur.fetchone()[0])
 
 
-def _cursor_rows(con: sqlite3.Connection) -> List[Tuple[str, Any]]:
+def _bubble_key_index(con: sqlite3.Connection) -> Dict[str, str]:
+    """读取一个 DB 的 bubble 键名（不取 value，避免拉大 blob）。
+
+    返回 bid -> 完整键 的映射；兼容 bubbleId:<cid>:<bid>、bubbleId:<bid>
+    及旧版 bubble:<cid>:<bid> / bubble:<bid> 写法。同一 bid 存在多种
+    写法时，无 composerId 的（账号登录版本）优先；带版本/分片后缀的
+    键（bid 在非末段）按独立段登记，供精确取值兜底。
+    """
     if not _table_exists(con, "cursorDiskKV"):
-        return []
+        return {}
     try:
-        return [(str(key), value) for key, value in con.execute("SELECT key, value FROM cursorDiskKV")]
+        rows = con.execute(
+            "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' OR key LIKE 'bubble:%'"
+        ).fetchall()
     except sqlite3.DatabaseError:
-        return []
+        return {}
+
+    result: Dict[str, str] = {}
+    scoped_keys: List[str] = []
+    for (key,) in rows:
+        key = str(key)
+        parts = key.split(":")
+        if len(parts) >= 3:
+            scoped_keys.append(key)
+        elif len(parts) == 2:
+            result[parts[1]] = key
+    # 无 composerId 写法优先；带 composerId 的写法登记各独立段兜底。
+    for key in scoped_keys:
+        parts = key.split(":")
+        for segment in parts[1:]:
+            result.setdefault(segment, key)
+    return result
 
 
 def _item_conversation_payloads(con: sqlite3.Connection, cid: str) -> List[Any]:
@@ -785,29 +842,6 @@ def _item_conversation_payloads(con: sqlite3.Connection, cid: str) -> List[Any]:
             continue
         visit(_decode_json(value))
     return result
-
-
-def _find_bubble_value(rows: List[Tuple[str, Any]], cid: str, bid: str) -> Any:
-    """查找带 composerId 或不带 composerId 的 bubbleId 键。"""
-    candidates = {
-        f"bubbleId:{cid}:{bid}",
-        f"bubbleId:{bid}",
-        f"bubble:{cid}:{bid}",
-        f"bubble:{bid}",
-    }
-    for key, value in rows:
-        if key in candidates:
-            return value
-
-    # 账号登录版本可能在 bubbleId 后追加版本/分片标记；只比较最后一段
-    # 或 key 中的独立段，避免按 SQL LIKE 误匹配相似 ID。
-    for key, value in rows:
-        if not key.startswith(("bubbleId:", "bubble:")):
-            continue
-        parts = key.split(":")
-        if bid in parts[1:]:
-            return value
-    return None
 
 
 def _message_type(header: dict, payload: Any) -> int:
@@ -887,91 +921,138 @@ def fetch_conversation(cid: str, paths: Optional[Iterable[str]] = None) -> List[
     order: Dict[str, int] = {}
     next_order = 0
 
-    loaded: List[Tuple[List[Tuple[str, Any]], List[Any]]] = []
+    # 阶段一：每个库只读本会话的 composerData 值（精确键，不碰全表大
+    # blob）和全部 bubble 键名，构造 bid -> 完整键 索引。
+    loaded: List[Tuple[str, Dict[str, str], List[Any]]] = []
     for path in db_paths:
         try:
             con = open_db_ro(path)
         except sqlite3.Error:
             continue
         try:
-            rows = _cursor_rows(con)
-            payloads = [
-                _decode_json(value)
-                for key, value in rows
-                if key == f"composerData:{cid}" or (
-                    key.startswith("composerData:") and _key_identifier(key, "composerData:") == cid
-                )
-            ]
+            key_index = _bubble_key_index(con)
+            payloads: List[Any] = []
+            try:
+                rows = con.execute(
+                    "SELECT key, value FROM cursorDiskKV WHERE key = ? OR key LIKE ?",
+                    (f"composerData:{cid}", f"composerData:{cid}:%"),
+                ).fetchall()
+                for key, value in rows:
+                    payloads.append(_decode_json(value))
+            except sqlite3.DatabaseError:
+                pass
             if not payloads:
                 payloads = _item_conversation_payloads(con, cid)
-            loaded.append((rows, payloads))
+            loaded.append((path, key_index, payloads))
         finally:
             con.close()
 
     # 不同 Cursor 版本可能把 composerData 和 bubble 正文分散到不同
-    # state.vscdb；查找 bubble 时使用全部数据库的键集合。
-    all_rows: List[Tuple[str, Any]] = []
-    for rows, _ in loaded:
-        all_rows.extend(rows)
+    # state.vscdb；跨库合并 bid 索引，先出现的库优先（与原全表行顺序
+    # 语义一致）。
+    all_keys: Dict[str, str] = {}
+    for _, key_index, _ in loaded:
+        for bid, key in key_index.items():
+            all_keys.setdefault(bid, key)
 
-    for rows, payloads in loaded:
-            for cdata in payloads:
-                headers = _conversation_headers(cdata)
-                for index, header in enumerate(headers):
-                    bid = _bubble_id(header)
-                    bubble_value = _find_bubble_value(all_rows, cid, bid) if bid else None
-                    payload = _decode_json(bubble_value) if bubble_value is not None else header
-                    if payload is None:
-                        payload = header
-                    if isinstance(payload, dict):
-                        # 某些版本将真正的 bubble 包在 data/bubble 字段中。
-                        for nested_key in ("bubble", "data"):
-                            nested = payload.get(nested_key)
-                            if isinstance(nested, dict) and not _message_text(payload) and _message_text(nested):
-                                payload = nested
-                                break
+    # 解析消息头，收集实际需要的 bubble 键集合。
+    wanted_keys: Set[str] = set()
+    for _, _, payloads in loaded:
+        for cdata in payloads:
+            headers = _conversation_headers(cdata)
+            for header in headers:
+                bid = _bubble_id(header)
+                key = all_keys.get(bid) if bid else None
+                if key:
+                    wanted_keys.add(key)
 
-                    text = _message_text(payload)
-                    if not text and payload is not header:
-                        text = _message_text(header)
-                    mtype = _message_type(header, payload)
-                    created = (
-                        header.get("createdAt")
-                        or header.get("timestamp")
-                        or (payload.get("createdAt") if isinstance(payload, dict) else None)
-                        or (payload.get("timestamp") if isinstance(payload, dict) else None)
-                        or ""
+    # 阶段二：按库用 WHERE key IN (...) 分批精确取值，替代原先对
+    # 全表行集合的线性扫描（O(消息数 × 总键数) -> O(总键数 + 消息数)）。
+    bubble_values: Dict[str, Any] = {}
+    for path, key_index, _ in loaded:
+        if not wanted_keys:
+            break
+        db_keys = sorted(key for key in key_index.values() if key in wanted_keys)
+        if not db_keys:
+            continue
+        try:
+            con = open_db_ro(path)
+        except sqlite3.Error:
+            continue
+        try:
+            for i in range(0, len(db_keys), 500):
+                batch = db_keys[i:i + 500]
+                placeholders = ",".join("?" * len(batch))
+                rows = con.execute(
+                    f"SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for key, value in rows:
+                    bubble_values.setdefault(str(key), value)
+        except sqlite3.DatabaseError:
+            pass
+        finally:
+            con.close()
+
+    for _, _, payloads in loaded:
+        for cdata in payloads:
+            headers = _conversation_headers(cdata)
+            for index, header in enumerate(headers):
+                bid = _bubble_id(header)
+                bubble_key = all_keys.get(bid) if bid else None
+                bubble_value = bubble_values.get(bubble_key) if bubble_key else None
+                payload = _decode_json(bubble_value) if bubble_value is not None else header
+                if payload is None:
+                    payload = header
+                if isinstance(payload, dict):
+                    # 某些版本将真正的 bubble 包在 data/bubble 字段中。
+                    for nested_key in ("bubble", "data"):
+                        nested = payload.get(nested_key)
+                        if isinstance(nested, dict) and not _message_text(payload) and _message_text(nested):
+                            payload = nested
+                            break
+
+                text = _message_text(payload)
+                if not text and payload is not header:
+                    text = _message_text(header)
+                mtype = _message_type(header, payload)
+                created = (
+                    header.get("createdAt")
+                    or header.get("timestamp")
+                    or (payload.get("createdAt") if isinstance(payload, dict) else None)
+                    or (payload.get("timestamp") if isinstance(payload, dict) else None)
+                    or ""
+                )
+                thinking = ""
+                if isinstance(payload, dict):
+                    thinking = _extract_text(
+                        payload.get("thinking")
+                        or payload.get("reasoning")
+                        or payload.get("analysis")
                     )
-                    thinking = ""
-                    if isinstance(payload, dict):
-                        thinking = _extract_text(
-                            payload.get("thinking")
-                            or payload.get("reasoning")
-                            or payload.get("analysis")
-                        )
-                    if not thinking and isinstance(header, dict):
-                        thinking = _extract_text(header.get("thinking") or header.get("reasoning"))
+                if not thinking and isinstance(header, dict):
+                    thinking = _extract_text(header.get("thinking") or header.get("reasoning"))
 
-                    # 既有 DB 与 workspace DB 可能各存一份相同 bubble；按
-                    # bubbleId 去重，但优先保留正文更完整的一份。
-                    key = f"bubble:{bid}" if bid else f"message:{index}:{mtype}:{created}:{text}"
-                    item = {
-                        "type": mtype,
-                        "time": str(created) if created is not None else "",
-                        "text": text,
-                        "thinking": thinking,
-                        "tools": _message_tools(payload),
-                    }
-                    if key not in order:
-                        order[key] = next_order
-                        next_order += 1
+                # 既有 DB 与 workspace DB 可能各存一份相同 bubble；按
+                # bubbleId 去重，但优先保留正文更完整的一份。
+                key = f"bubble:{bid}" if bid else f"message:{index}:{mtype}:{created}:{text}"
+                item = {
+                    "type": mtype,
+                    "time": str(created) if created is not None else "",
+                    "text": text,
+                    "thinking": thinking,
+                    "tools": _message_tools(payload),
+                }
+                if key not in order:
+                    order[key] = next_order
+                    next_order += 1
+                    messages_by_key[key] = item
+                else:
+                    old = messages_by_key[key]
+                    old_score = len(old.get("text", "")) + len(old.get("thinking", ""))
+                    new_score = len(item.get("text", "")) + len(item.get("thinking", ""))
+                    if new_score > old_score or len(item.get("tools", [])) > len(old.get("tools", [])):
                         messages_by_key[key] = item
-                    else:
-                        old = messages_by_key[key]
-                        old_score = len(old.get("text", "")) + len(old.get("thinking", ""))
-                        new_score = len(item.get("text", "")) + len(item.get("thinking", ""))
-                        if new_score > old_score or len(item.get("tools", [])) > len(old.get("tools", [])):
-                            messages_by_key[key] = item
     messages = [messages_by_key[key] for key in sorted(order, key=order.get)]
     return messages
 
@@ -1465,15 +1546,36 @@ OPS = [
 # TUI（textual）
 # =====================================================================
 
+def _db_fingerprint() -> Tuple[Tuple[str, float, int], ...]:
+    """数据库文件指纹：stat (mtime, size)，用于定时刷新前的快速短路。
+
+    只做文件系统调用（O(库数量)），避免每 2~5 秒全量 scan() 拉取所有
+    cursorDiskKV 大 blob。任一 -wal/-shm 变化也计入，避免漏检未
+    checkpoint 的写入。
+    """
+    fingerprint: List[Tuple[str, float, int]] = []
+    for db_path in database_paths():
+        for p in (db_path, db_path + "-wal", db_path + "-shm"):
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            fingerprint.append((p, st.st_mtime, st.st_size))
+    return tuple(sorted(fingerprint))
+
+
 def _tui_imports():
     try:
+        from textual import on
         from textual.app import App, ComposeResult
         from textual.binding import Binding
         from textual.containers import Horizontal, Vertical
         from textual.screen import ModalScreen, Screen
         from textual.widgets import Button, DataTable, Footer, Header, Label, MarkdownViewer, Static
+        from textual.worker import Worker, WorkerState
         return (App, ComposeResult, Binding, Horizontal, Vertical, ModalScreen, Screen,
-                Button, DataTable, Footer, Header, Label, MarkdownViewer, Static)
+                Button, DataTable, Footer, Header, Label, MarkdownViewer, Static,
+                on, Worker, WorkerState)
     except ImportError:
         return None
 
@@ -1494,7 +1596,8 @@ TUI_APP_CLASS = None  # 测试可引用
 
 def _build_app_class(mods):
     (App, ComposeResult, Binding, Horizontal, Vertical, ModalScreen, Screen,
-     Button, DataTable, Footer, Header, Label, MarkdownViewer, Static) = mods
+     Button, DataTable, Footer, Header, Label, MarkdownViewer, Static,
+     on, Worker, WorkerState) = mods
 
     STATUS_LABEL = {
         S_ARCHIVED: "归档",
@@ -1601,6 +1704,9 @@ def _build_app_class(mods):
             self._suppress_row_selected: Optional[str] = None
             self._refresh_timer = None
             self._last_scan_error: Optional[str] = None
+            self._last_fingerprint: Optional[Tuple[Tuple[str, float, int], ...]] = None
+            self._chat_worker: Optional[Worker] = None
+            self._chat_title: Optional[str] = None
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
@@ -1625,7 +1731,8 @@ def _build_app_class(mods):
             self.set_filter_buttons()
             # Cursor 在另一个进程中归档/取消归档时不会主动通知本 TUI；
             # 定时重新扫描，避免必须退出后再次启动脚本才能看到状态变化。
-            self._refresh_timer = self.set_interval(2.0, self.refresh_data_quiet)
+            # 指纹无变化时跳过 scan()，避免周期性全量扫描阻塞事件循环。
+            self._refresh_timer = self.set_interval(5.0, self.refresh_data_quiet)
 
         # ---- 数据 ----
 
@@ -1645,6 +1752,13 @@ def _build_app_class(mods):
             ))
 
         def refresh_data_quiet(self) -> None:
+            # 数据库文件没有变化时直接跳过，避免每 5 秒全量 scan()。
+            try:
+                fp = _db_fingerprint()
+            except OSError:
+                fp = None
+            if fp is not None and fp == self._last_fingerprint:
+                return
             self.refresh_data(quiet=True)
 
         def refresh_data(self, quiet: bool = False, force: bool = False) -> bool:
@@ -1653,6 +1767,12 @@ def _build_app_class(mods):
             try:
                 new_sessions = scan()
                 new_signature = self._session_signature(new_sessions)
+                # scan 成功后同步指纹，供定时刷新短路；失败路径不更新，
+                # 保留旧指纹以便下次定时重试。
+                try:
+                    self._last_fingerprint = _db_fingerprint()
+                except OSError:
+                    self._last_fingerprint = None
                 if not force and new_signature == old_signature:
                     self._last_scan_error = None
                     self.update_status()
@@ -1715,7 +1835,9 @@ def _build_app_class(mods):
             self.update_status()
 
         def update_status(self) -> None:
-            running = "● 运行中" if cursor_running() else "○ 未运行"
+            # 状态栏展示用缓存版检测，避免每次勾选/切选项卡都 spawn
+            # tasklist 子进程阻塞事件循环（Windows 下 0.5~2s）。
+            running = "● 运行中" if cursor_running_cached() else "○ 未运行"
             total = len(self.visible_sessions())
             arch = len(self.sess_classes[S_ARCHIVED])
             mirror = len(self.sess_classes[S_MIRROR_ONLY])
@@ -1841,14 +1963,41 @@ def _build_app_class(mods):
             cid = self.row_to_id.get(self.current_row)
             if cid is None:
                 return
+            if self._chat_worker is not None:
+                self.notify("聊天记录正在加载中…", timeout=2)
+                return
             sess = next((s for s in self.sessions if s.composer_id == cid), None)
             title = sess.display_name if sess else cid
-            try:
-                md = fmt_conversation_markdown(cid, title)
-            except Exception as e:
-                self.notify(f"读取聊天记录失败: {e}", severity="error", timeout=5)
+
+            def _generate() -> str:
+                # 数据层在 worker 线程内新建 sqlite3 连接，主线程不参与，
+                # 线程安全；生成过程不再阻塞事件循环。
+                return fmt_conversation_markdown(cid, title)
+
+            self._chat_worker = self.run_worker(_generate, thread=True, exit_on_error=False)
+            self._chat_title = title
+            self.notify("正在加载聊天记录…", timeout=2)
+
+        @on(Worker.StateChanged)
+        def on_worker_state_changed(self, event: "Worker.StateChanged") -> None:
+            """聊天详情 worker 结束时在主线程打开查看器/提示错误。"""
+            if event.worker is not self._chat_worker:
                 return
-            self.push_screen(ChatScreen(title, md))
+            if event.state == WorkerState.SUCCESS:
+                worker = self._chat_worker
+                title = self._chat_title or ""
+                self._chat_worker = None
+                self._chat_title = None
+                if self.screen is not None:
+                    self.push_screen(ChatScreen(title, worker.result or ""))
+            elif event.state == WorkerState.ERROR:
+                worker = self._chat_worker
+                self._chat_worker = None
+                self._chat_title = None
+                self.notify(f"读取聊天记录失败: {worker.error}", severity="error", timeout=5)
+            elif event.state == WorkerState.CANCELLED:
+                self._chat_worker = None
+                self._chat_title = None
 
         def action_delete_selected(self) -> None:
             if not self.selected:
