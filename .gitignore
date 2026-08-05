@@ -39,3 +39,7 @@ backups/
 .env
 .env.*
 !.env.example
+
+# Tests (kept locally, not shipped in the repo)
+tests/
+.pytest_cache/
