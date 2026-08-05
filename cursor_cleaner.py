@@ -1523,7 +1523,12 @@ def rewrite_mirror(con: sqlite3.Connection, delete_ids: Set[str]) -> Tuple[int, 
                 continue
             normalized = dict(header)
             meta = table_map.get(header_cid)
-            if meta is not None and "isArchived" in normalized:
+            # 镜像的 isArchived 是权威来源：新版 Cursor 归档只写 ItemTable
+            # 镜像，composerHeaders 表的 isArchived 已停止更新、可能过时。
+            # 只用表行在镜像缺失该字段时兜底，绝不能反过来覆盖镜像值，
+            # 否则删除一个会话会把其余"表 0 + 镜像 1"的归档会话全部
+            # 误改成未归档（反之亦然）。
+            if meta is not None and "isArchived" not in normalized:
                 normalized["isArchived"] = _as_bool(meta.get("isArchived"))
             kept.append(normalized)
             if header_cid:
