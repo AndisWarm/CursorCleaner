@@ -2545,6 +2545,16 @@ def _build_app_class(mods):
         S_CONTENT_ONLY: "孤儿",
     }
 
+    class NoToggleHeader(Header):
+        """固定行高的 Header：textual 默认点击任意位置会在 1/3 行高间切换
+        tall/compact，且事件分派会同时调用 MRO 上子类与父类的 handler，
+        单纯重写 _on_click 无法屏蔽；这里直接在事件入口拦截点击。"""
+
+        async def on_event(self, event) -> None:
+            if isinstance(event, Click):
+                return
+            await super().on_event(event)
+
     class UserDotHovered(Message):
         """鼠标悬停到索引圆点上。index=-1 表示离开轨道。"""
 
@@ -2625,7 +2635,7 @@ def _build_app_class(mods):
             self._run_worker: Optional[Worker] = None
 
         def compose(self) -> ComposeResult:
-            yield Header(show_clock=True)
+            yield NoToggleHeader(show_clock=True)
             yield Static("正在扫描磁盘占用…", id="cleanup-status")
             with VerticalScroll(id="cleanup-list"):
                 yield Label("扫描中…", id="cleanup-empty")
@@ -3014,7 +3024,7 @@ def _build_app_class(mods):
             self._last_preview_index = -1
 
         def compose(self) -> ComposeResult:
-            yield Header(show_clock=True)
+            yield NoToggleHeader(show_clock=True)
             with Horizontal(id="chat-body"):
                 yield ChatLog(self._layout, self._msgs, self._title, id="chat-log")
             # 索引轨道与信息面板都是绝对定位覆盖层，位置由
@@ -3153,7 +3163,7 @@ def _build_app_class(mods):
             self._backup_worker: Optional[Worker] = None
 
         def compose(self) -> ComposeResult:
-            yield Header(show_clock=True)
+            yield NoToggleHeader(show_clock=True)
             yield Static(id="status-bar")
             with Horizontal(id="filters"):
                 yield Label("筛选:")
