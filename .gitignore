@@ -7,6 +7,15 @@ __pycache__/
 .venv/
 venv/
 env/
+conda-envs/
+miniconda/
+anaconda/
+
+# Packaging outputs (PyInstaller)
+build/
+dist/
+*.egg-info/
+*.whl
 
 # Cursor / SQLite data and backups
 *.db
