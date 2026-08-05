@@ -25,7 +25,7 @@ CLI 用法（自动化/测试）:
 会话状态分类:
     ARCHIVED      表或镜像标记为已归档
     ACTIVE        表或镜像存在且未归档
-    MIRROR_ONLY   仅在镜像中且无正文（空壳残留）
+    MIRROR_ONLY   仅在镜像中（表行已删，残留）
     CONTENT_ONLY  仅在正文中（表/镜像都已删，孤儿数据）
 """
 
@@ -135,12 +135,6 @@ class Session:
             if self.table_archived or self.mirror_archived:
                 return S_ARCHIVED
             if self.in_mirror and not self.in_table:
-                # 新版 Cursor 的会话列表只写入 ItemTable 镜像，
-                # composerHeaders 表已停止更新，因此“镜像有、表没有”
-                # 并不代表表行被删过。只有没有任何正文键的空壳
-                # （例如中断的删除过程遗留）才算残留，其余视为活跃。
-                if self.content_keys:
-                    return S_ACTIVE
                 return S_MIRROR_ONLY
             return S_ACTIVE
         if self.content_keys:
@@ -1401,7 +1395,7 @@ def fmt_message_ts(value: Any) -> str:
 
 
 def print_report(classes: Dict[str, List[Session]]):
-    for label, key in [("已归档", S_ARCHIVED), ("镜像残留(空壳)", S_MIRROR_ONLY),
+    for label, key in [("已归档", S_ARCHIVED), ("镜像残留(表已删)", S_MIRROR_ONLY),
                        ("正文孤儿(表/镜像已删)", S_CONTENT_ONLY), ("未归档", S_ACTIVE)]:
         lst = classes[key]
         print(f"{label}: {len(lst)}")
