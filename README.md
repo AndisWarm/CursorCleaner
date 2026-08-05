@@ -12,8 +12,7 @@
 - 查看聊天记录
 - 识别归档会话、镜像残留和正文孤儿数据
 - 删除已归档会话、镜像残留和正文孤儿数据
-- 删除前自动备份数据库
-- 备份和恢复 Cursor 会话数据库
+- 会话级备份：把勾选会话导出为 JSON 存档（不复制整个数据库），可从存档恢复会话
 - 清理会话搜索索引 `conversation-search.db`
 - 磁盘清理面板：一键清理工具备份文件、搜索索引、压缩会话数据库、删除 Cursor 缓存/日志目录
 - 复制会话 ID 到剪贴板
@@ -96,8 +95,8 @@ start_cursor_cleaner.bat
 | `N` | 取消全选 |
 | `V` | 查看当前会话聊天记录 |
 | `C` | 复制当前会话完整 ID 到剪贴板 |
-| `D` | 删除勾选的会话 |
-| `B` | 备份数据库 |
+| `D` | 删除勾选的会话（不自动备份，建议先按 `B` 备份） |
+| `B` | 备份勾选的会话为 JSON 存档 |
 | `X` | 打开磁盘清理面板（备份/索引/VACUUM/缓存） |
 | `R` | 立即刷新会话列表 |
 | `Q` | 退出工具 |
@@ -117,13 +116,26 @@ python cursor_cleaner.py --op preview
 python cursor_cleaner.py --op delete-archived --yes
 ```
 
+备份指定会话为 JSON 存档：
+
+```bash
+python cursor_cleaner.py --op backup-sessions --ids <id1>,<id2>
+```
+
+从 JSON 存档恢复会话（只写回缺失的数据，不覆盖现有会话）：
+
+```bash
+python cursor_cleaner.py --op restore-sessions --file <备份.json>
+```
+
 其他可用操作：
 
 ```text
-backup          备份当前数据库
-restore         从备份恢复
-wipe-all        清空全部会话（危险）
-purge-index     清理 conversation-search.db
+backup-sessions  备份指定会话为 JSON 存档（--ids 逗号分隔）
+restore-sessions 从 JSON 存档恢复会话（--file 指定，否则列表选择）
+wipe-all         清空全部会话（危险）
+purge-index      清理 conversation-search.db
+repair-mirror    修复 composerHeaders 镜像
 ```
 
 跳过 Cursor 运行检测：
