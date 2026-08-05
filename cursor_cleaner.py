@@ -8,14 +8,17 @@ TUI 用法:
 CLI 用法（自动化/测试）:
     python cursor_cleaner.py --op preview
     python cursor_cleaner.py --op delete-archived --yes
+    python cursor_cleaner.py --op backup-sessions --ids <id1>,<id2>
+    python cursor_cleaner.py --op restore-sessions --file <备份.json>
 
 操作列表:
     preview         扫描并分类会话（归档/残留/孤儿/未归档）
     delete-archived 删除已归档会话 + 镜像残留 + 正文孤儿（核心功能）
-    backup          备份当前数据库
-    restore         从备份恢复
+    backup-sessions 备份指定会话为 JSON 存档（--ids 逗号分隔）
+    restore-sessions 从 JSON 存档恢复会话（--file 指定，否则列表选择）
     wipe-all        清空全部会话（危险）
     purge-index     清理会话搜索索引 conversation-search.db
+    repair-mirror   修复 composerHeaders 镜像
 
 数据模型（state.vscdb）:
     - composerHeaders: 每行一个会话，isArchived=1 表示已归档
@@ -30,6 +33,7 @@ CLI 用法（自动化/测试）:
 """
 
 import argparse
+import base64
 from datetime import datetime
 import gzip
 import glob
@@ -1294,27 +1298,385 @@ def rewrite_mirror(con: sqlite3.Connection, delete_ids: Set[str]) -> Tuple[int, 
         return 0, 0
     return total_before, total_after
 
-def backup() -> List[str]:
-    """备份所有已发现数据库的三件套到 .bak-<时间戳>。"""
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    made = []
+# ---- 会话级备份（JSON 存档） ----
+#
+# 一个会话的数据可能落在多个 state.vscdb，且每个库里分散在
+# composerHeaders 表行、ItemTable 镜像 JSON、cursorDiskKV 正文键三处。
+# 会话级备份按 composerId 收集这三处的原始数据，导出为 JSON 存档；
+# 恢复时按原库路径写回，已存在的行/键/镜像条目一律跳过，绝不覆盖
+# 现有数据（避免旧备份覆盖新数据）。
+
+SESSION_BACKUP_VERSION = 1
+
+
+def _encode_backup_value(value: Any) -> Any:
+    """SQLite 值转 JSON 可序列化结构：str/数字/None 直存，bytes 标记类型。
+
+    备份文件里必须保留 TEXT/BLOB 的区别，否则恢复时无法原样写回。
+    """
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return {"t": "b", "v": base64.b64encode(bytes(value)).decode("ascii")}
+    return {"t": "s", "v": value}
+
+
+def _decode_backup_value(obj: Any) -> Any:
+    """_encode_backup_value 的逆操作。"""
+    if isinstance(obj, dict) and obj.get("t") in ("s", "b"):
+        if obj["t"] == "b":
+            try:
+                return base64.b64decode(obj["v"])
+            except (TypeError, ValueError):
+                return obj.get("v")
+        return obj.get("v")
+    return obj
+
+
+def _collect_session_kv(con: sqlite3.Connection, cid: str) -> List[Tuple[str, Any]]:
+    """收集一个库中某会话的全部 cursorDiskKV 键值。
+
+    键匹配规则与 remove_keys_for() 对称：直接前缀匹配 + 从
+    composerData 消息头反向关联无 composerId 的 bubbleId:<bid>。
+    返回 [(key, value), ...]，value 为已解码的原始 SQLite 值。
+    """
+    if not _table_exists(con, "cursorDiskKV"):
+        return []
+
+    # 先解析 composerData 拿到无 composerId 的 bubbleId，与删除逻辑一致。
+    bubble_ids: Set[str] = set()
+    try:
+        row = con.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{cid}",),
+        ).fetchone()
+        if row:
+            for header in _conversation_headers(row[0]):
+                bid = _bubble_id(header)
+                if bid:
+                    bubble_ids.add(bid)
+    except sqlite3.DatabaseError:
+        pass
+
+    keys: List[str] = []
+    try:
+        for (key_value,) in con.execute("SELECT key FROM cursorDiskKV"):
+            key = str(key_value)
+            if (
+                key == f"composerData:{cid}"
+                or key.startswith(f"composerData:{cid}:")
+                or key == f"composerVirtualRowHeights:{cid}"
+                or key.startswith(f"composerVirtualRowHeights:{cid}:")
+                or key.startswith(f"bubbleId:{cid}:")
+                or key == f"checkpointId:{cid}"
+                or key.startswith(f"checkpointId:{cid}:")
+                or key == f"ofsContent:{cid}"
+                or key.startswith(f"ofsContent:{cid}:")
+            ):
+                keys.append(key)
+                continue
+            if bubble_ids and key.startswith(("bubbleId:", "bubble:")):
+                if any(bid in key.split(":")[1:] for bid in bubble_ids):
+                    keys.append(key)
+    except sqlite3.DatabaseError:
+        return []
+
+    if not keys:
+        return []
+    placeholders = ",".join("?" for _ in keys)
+    try:
+        rows = con.execute(
+            f"SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})",
+            keys,
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return []
+    return [(str(key), value) for key, value in rows]
+
+
+def _collect_mirror_headers(con: sqlite3.Connection, cid: str) -> List[dict]:
+    """从 ItemTable 镜像中提取某会话的 header 对象。
+
+    返回 [{item_key, header}]，header 为镜像 JSON 中该 cid 的原始
+    字典对象，恢复时按原 item_key 原样放回。
+    """
+    if not _table_exists(con, "ItemTable"):
+        return []
+    try:
+        rows = con.execute(
+            "SELECT key, value FROM ItemTable WHERE key LIKE 'composer.%'"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return []
+
+    found: List[dict] = []
+    visited: Set[int] = set()
+
+    def visit(node: Any, item_key: str, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            marker = id(node)
+            if marker in visited:
+                return
+            visited.add(marker)
+            node_cid = _header_id(node.get("composerId") or node.get("composerID"))
+            if node_cid == cid:
+                found.append({"item_key": item_key, "header": node})
+                return
+            for key, child in node.items():
+                if isinstance(child, (dict, list)):
+                    visit(child, item_key, depth + 1)
+        elif isinstance(node, list):
+            for child in node:
+                if isinstance(child, (dict, list)):
+                    visit(child, item_key, depth + 1)
+
+    for item_key, value in rows:
+        item_key = str(item_key)
+        if item_key not in COMPOSER_MIRROR_KEYS and "composer" not in item_key.lower():
+            continue
+        visited.clear()
+        visit(_decode_json(value), item_key)
+    return found
+
+
+def collect_session_records(sessions: List[Session]) -> List[dict]:
+    """跨库收集勾选会话的完整原始数据，供备份导出。
+
+    返回 [{composer_id, db, table_row, mirror_headers, kv}]：
+      db             键值所在的库文件路径（恢复时按此写回）
+      table_row      该库 composerHeaders 中的原始行（列名 -> 编码后值），
+                     无行时为 None
+      mirror_headers 该库 ItemTable 镜像中的原始 header 列表
+      kv             cursorDiskKV 中的 [(key, 编码后值), ...]
+    """
+    ids = {s.composer_id for s in sessions}
+    if not ids:
+        return []
+    records: List[dict] = []
     for db_path in database_paths():
-        for p in (db_path, db_path + "-wal", db_path + "-shm"):
-            if os.path.exists(p):
-                dst = f"{p}.bak-{ts}"
-                shutil.copy2(p, dst)
-                made.append(dst)
-    return made
+        try:
+            con = open_db_ro(db_path)
+        except sqlite3.Error:
+            continue
+        try:
+            for cid in ids:
+                record: dict = {
+                    "composer_id": cid,
+                    "db": db_path,
+                    "table_row": None,
+                    "mirror_headers": [],
+                    "kv": [],
+                }
+                # composerHeaders 原始行
+                if _table_exists(con, "composerHeaders"):
+                    try:
+                        columns = [item[1] for item in con.execute("PRAGMA table_info(composerHeaders)").fetchall()]
+                        row = con.execute(
+                            "SELECT * FROM composerHeaders WHERE composerId=?",
+                            (cid,),
+                        ).fetchone()
+                        if row is not None:
+                            record["table_row"] = {
+                                col: _encode_backup_value(val)
+                                for col, val in zip(columns, row)
+                            }
+                    except sqlite3.DatabaseError:
+                        pass
+                record["mirror_headers"] = _collect_mirror_headers(con, cid)
+                record["kv"] = [
+                    (key, _encode_backup_value(value))
+                    for key, value in _collect_session_kv(con, cid)
+                ]
+                if record["table_row"] is None and not record["mirror_headers"] and not record["kv"]:
+                    continue
+                records.append(record)
+        except sqlite3.DatabaseError:
+            continue
+        finally:
+            con.close()
+    return records
 
 
-def list_backups() -> List[str]:
-    return sorted(glob.glob(DB + ".bak-*"), key=os.path.getmtime, reverse=True)
+def backup_sessions(sessions: List[Session]) -> str:
+    """把勾选会话导出为 JSON 存档文件，返回存档路径。
+
+    存档放在全局库所在目录（默认 globalStorage），文件名
+    sessions-backup-<时间戳>.json；只读操作，不需要 Cursor 退出。
+    """
+    data = {
+        "version": SESSION_BACKUP_VERSION,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sessions": collect_session_records(sessions),
+    }
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    out_path = os.path.join(os.path.dirname(DB), f"sessions-backup-{ts}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return out_path
+
+
+def list_session_backups() -> List[str]:
+    """列出全部会话级备份存档（新到旧）。"""
+    pattern = os.path.join(os.path.dirname(DB), "sessions-backup-*.json")
+    return sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+
+
+def _restore_table_row(con: sqlite3.Connection, cid: str, table_row: dict) -> bool:
+    """写回 composerHeaders 行；已存在则跳过。返回是否新增。"""
+    if not _table_exists(con, "composerHeaders"):
+        return False
+    existing = con.execute(
+        "SELECT 1 FROM composerHeaders WHERE composerId=? LIMIT 1",
+        (cid,),
+    ).fetchone()
+    if existing:
+        return False
+    columns = [item[1] for item in con.execute("PRAGMA table_info(composerHeaders)").fetchall()]
+    if not columns:
+        return False
+    values = [_decode_backup_value(table_row.get(col)) for col in columns]
+    placeholders = ",".join("?" * len(columns))
+    con.execute(
+        f"INSERT INTO composerHeaders ({','.join(columns)}) VALUES ({placeholders})",
+        values,
+    )
+    return True
+
+
+def _restore_mirror_headers(con: sqlite3.Connection, headers: List[dict]) -> int:
+    """把备份的镜像 header 放回原 ItemTable 条目；已存在则跳过。
+
+    只做"容器内 append 缺失的 cid"，不改动容器结构与排序。返回新增数。
+    """
+    if not headers or not _table_exists(con, "ItemTable"):
+        return 0
+    added = 0
+    for item in headers:
+        item_key = str(item.get("item_key") or "")
+        header = item.get("header")
+        if not item_key or not isinstance(header, dict):
+            continue
+        cid = _header_id(header.get("composerId") or header.get("composerID"))
+        if not cid:
+            continue
+        row = con.execute(
+            "SELECT value FROM ItemTable WHERE key=?", (item_key,)
+        ).fetchone()
+        if row is None:
+            continue
+        data = _decode_json(row[0])
+        if not isinstance(data, dict):
+            continue
+        container_key = next(
+            (
+                key for key in ("allComposers", "composers", "composerHeaders", "items")
+                if isinstance(data.get(key), list)
+            ),
+            None,
+        )
+        if container_key is None:
+            continue
+        exists = any(
+            isinstance(h, dict) and _header_id(h.get("composerId") or h.get("composerID")) == cid
+            for h in data[container_key]
+        )
+        if exists:
+            continue
+        data[container_key].append(dict(header))
+        serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        original_value = row[0]
+        if isinstance(original_value, str):
+            payload = serialized
+        else:
+            payload = serialized.encode("utf-8")
+        con.execute(
+            "UPDATE ItemTable SET value=? WHERE key=?",
+            (payload, item_key),
+        )
+        added += 1
+    return added
+
+
+def restore_sessions(backup_path: str) -> dict:
+    """从 JSON 存档恢复会话数据，返回统计信息。
+
+    逐库写回 composerHeaders 行、ItemTable 镜像 header、cursorDiskKV
+    键值；已存在的数据一律跳过（不覆盖）。调用方负责 Cursor 退出检查。
+    """
+    with open(backup_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    sessions_done: Set[str] = set()
+    table_rows = 0
+    mirror_added = 0
+    kv_added = 0
+    skipped = 0
+
+    # 按库分组，一次连接写一个库，避免反复开关连接。
+    by_db: Dict[str, List[dict]] = {}
+    for record in data.get("sessions", []):
+        by_db.setdefault(record.get("db", ""), []).append(record)
+
+    for db_path, records in by_db.items():
+        if not os.path.isfile(db_path):
+            skipped += len(records)
+            continue
+        try:
+            con = open_db_rw(db_path)
+        except sqlite3.Error:
+            skipped += len(records)
+            continue
+        try:
+            for record in records:
+                cid = str(record.get("composer_id") or "")
+                if not cid:
+                    skipped += 1
+                    continue
+                try:
+                    table_row = record.get("table_row")
+                    if isinstance(table_row, dict) and _restore_table_row(con, cid, table_row):
+                        table_rows += 1
+                    mirror_added += _restore_mirror_headers(con, record.get("mirror_headers") or [])
+                    for key, encoded in record.get("kv") or []:
+                        if not isinstance(key, str) or not isinstance(encoded, dict):
+                            continue
+                        existing = con.execute(
+                            "SELECT 1 FROM cursorDiskKV WHERE key=? LIMIT 1",
+                            (key,),
+                        ).fetchone()
+                        if existing:
+                            skipped += 1
+                            continue
+                        con.execute(
+                            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                            (key, _decode_backup_value(encoded)),
+                        )
+                        kv_added += 1
+                    sessions_done.add(cid)
+                except sqlite3.DatabaseError:
+                    con.rollback()
+                    skipped += 1
+                    continue
+            con.commit()
+        finally:
+            con.close()
+
+    return {
+        "sessions": len(sessions_done),
+        "table_rows": table_rows,
+        "mirror_added": mirror_added,
+        "kv_added": kv_added,
+        "skipped": skipped,
+    }
 
 
 def delete_sessions(sessions: List[Session]) -> dict:
     """
     删除指定会话：表行 + 镜像条目 + 正文键，单事务提交，之后 VACUUM。
-    返回统计信息。调用方负责前置备份。
+    返回统计信息。本函数不自动备份；需要留档时请先调用
+    backup_sessions() 备份勾选会话。
     """
     ids = {s.composer_id for s in sessions}
     table_del = 0
@@ -1449,55 +1811,67 @@ def op_delete_archived(args):
     key_cnt = sum(s.content_keys for s in targets)
     print(f"将删除 {len(targets)} 个会话（归档 {len(classes[S_ARCHIVED])}，镜像残留 "
           f"{len(classes[S_MIRROR_ONLY])}，孤儿 {len(classes[S_CONTENT_ONLY])}），正文键 {key_cnt} 个")
+    print("本操作不自动备份，如需留档请先用 backup-sessions 备份。")
     if not args.yes:
         if input("确认删除？[y/N] ").strip().lower() != "y":
             print("已取消。")
             return
     require_closed(args.force)
-    made = backup()
-    print(f"已备份: {', '.join(made)}")
     stats = delete_sessions(targets)
     print(f"完成: 会话 {stats['sessions']}，表行 {stats['table_rows']}，"
           f"镜像 {stats['mirror'][0]} -> {stats['mirror'][1]}，正文键 {stats['keys']}")
 
 
-def op_backup(_args):
-    made = backup()
-    print(f"已备份 {len(made)} 个文件:")
-    for p in made:
-        print("  ", p)
-
-
-def op_restore(args):
-    baks = list_backups()
-    if not baks:
-        print("没有找到备份（state.vscdb.bak-*）。")
+def op_backup_sessions(args):
+    if not args.ids:
+        print("[err] 请用 --ids 指定要备份的会话 ID（逗号分隔），"
+              "或用 TUI 勾选会话后按 b。")
         return
-    print("可用备份（新到旧）:")
-    for i, p in enumerate(baks, 1):
-        ts = fmt_message_ts(os.path.getmtime(p) * 1000)
-        print(f"  [{i}] {os.path.basename(p)}  ({ts})")
-    if args.op:
-        idx = 0
+    ids = {cid.strip() for cid in args.ids.split(",") if cid.strip()}
+    if not ids:
+        print("[err] --ids 为空。")
+        return
+    all_sessions = scan(include_hidden=True)
+    sessions = [s for s in all_sessions if s.composer_id in ids]
+    if not sessions:
+        print("[err] 没有找到与 --ids 匹配的会话。")
+        return
+    out = backup_sessions(sessions)
+    kv = sum(s.content_keys for s in sessions)
+    print(f"已备份 {len(sessions)} 个会话（正文键 {kv} 个）: {out}")
+
+
+def op_restore_sessions(args):
+    if args.file:
+        baks = [os.path.abspath(args.file)]
+        if not os.path.isfile(baks[0]):
+            print(f"[err] 备份文件不存在: {baks[0]}")
+            return
     else:
+        baks = list_session_backups()
+        if not baks:
+            print("没有找到会话备份（sessions-backup-*.json）。")
+            return
+        print("可用备份（新到旧）:")
+        for i, p in enumerate(baks, 1):
+            ts = fmt_message_ts(os.path.getmtime(p) * 1000)
+            print(f"  [{i}] {os.path.basename(p)}  ({ts})")
         try:
             idx = int(input("选择要恢复的备份编号: ")) - 1
         except (ValueError, EOFError):
             print("已取消。")
             return
-    if not (0 <= idx < len(baks)):
-        print("[err] 编号无效。")
-        return
+        if not (0 <= idx < len(baks)):
+            print("[err] 编号无效。")
+            return
+        baks = [baks[idx]]
     require_closed(args.force)
-    tag = os.path.basename(baks[idx]).split("bak-", 1)[1]
-    group = [p for p in (DB, DB + "-wal", DB + "-shm") if os.path.exists(f"{p}.bak-{tag}")]
-    if not args.yes and input("恢复会覆盖当前数据库，继续？[y/N] ").strip().lower() != "y":
+    if not args.yes and input("恢复只写回备份中缺失的数据，不覆盖现有会话，继续？[y/N] ").strip().lower() != "y":
         print("已取消。")
         return
-    for p in group:
-        shutil.copy2(f"{p}.bak-{tag}", p)
-        print(f"  已恢复 {os.path.basename(p)}")
-    print("恢复完成，重新打开 Cursor 生效。")
+    stats = restore_sessions(baks[0])
+    print(f"完成: 恢复会话 {stats['sessions']}，表行 {stats['table_rows']}，"
+          f"镜像 {stats['mirror_added']}，正文键 {stats['kv_added']}，跳过已存在 {stats['skipped']}")
 
 
 def op_wipe_all(args):
@@ -1506,12 +1880,11 @@ def op_wipe_all(args):
         print("数据库为空。")
         return
     print(f"将清空全部会话（共 {len(sessions)} 条，含未归档），此操作不可逆！")
+    print("本操作不自动备份，如需留档请先运行 backup-sessions --ids 或 TUI 按 b 备份。")
     if not args.yes and input("确认清空全部会话？[y/N] ").strip().lower() != "y":
         print("已取消。")
         return
     require_closed(args.force)
-    made = backup()
-    print(f"已备份: {', '.join(made)}")
     stats = delete_sessions(sessions)
     print(f"完成: 会话 {stats['sessions']}，表行 {stats['table_rows']}，"
           f"镜像 {stats['mirror'][0]} -> {stats['mirror'][1]}，正文键 {stats['keys']}")
@@ -1529,7 +1902,6 @@ def op_purge_index(_args):
 def op_repair_mirror(args):
     """修复活动会话未出现在 composer 镜像中的情况。"""
     require_closed(args.force)
-    made = backup()
     before = after = 0
     for db_path in database_paths():
         con = open_db_rw(db_path)
@@ -1543,21 +1915,276 @@ def op_repair_mirror(args):
             raise
         finally:
             con.close()
-    print(f"镜像已修复: {before} -> {after} 个条目")
-    print(f"备份: {', '.join(made) if made else '无'}")
+    print(f"镜像已修复: {before} -> {after} 个条目（本操作不自动备份）")
 
 
 def require_closed(force: bool):
     if cursor_running() and not force:
-        print("[err] Cursor 正在运行，请完全退出后重试（或加 --force 强行执行，有备份兜底）")
+        print("[err] Cursor 正在运行，请完全退出后重试（或加 --force 强行执行）")
         sys.exit(1)
+
+
+# =====================================================================
+# 磁盘清理（TUI 共用；纯函数，不依赖 UI）
+# =====================================================================
+
+# 可清理类目的固定顺序
+CLEANUP_TARGETS = ("backups", "search_index", "vacuum", "cache_dirs")
+# 需要 Cursor 完全退出才能安全清理的类目
+CLEANUP_NEEDS_CLOSED = frozenset({"vacuum", "cache_dirs"})
+
+CACHE_DIR_NAMES = (
+    "Cache", "Code Cache", "GPUCache", "DawnCache", "CachedData",
+    "logs", "Crashpad",
+)
+
+
+def _fmt_bytes(n: int) -> str:
+    """人类可读的字节数。"""
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.1f} GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.1f} MB"
+    if n >= 1 << 10:
+        return f"{n / (1 << 10):.1f} KB"
+    return f"{n} B"
+
+
+def _dir_size(path: str) -> int:
+    """递归统计目录占用字节数，跳过无法访问的条目。"""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def _list_backup_files() -> List[str]:
+    """收集会话级 JSON 备份与遗留的旧 .bak-* 三件套。
+
+    sessions-backup-*.json 放在 globalStorage（会话级备份）；旧的
+    state.vscdb*.bak-* 可能散落在各 workspace。用递归 glob 而非
+    database_paths()，这样即使工作区目录已被整体清理、备份文件仍在
+    时也能被发现。
+    """
+    user_dir = os.path.dirname(GLOBAL_STORAGE)  # %APPDATA%\Cursor\User
+    found = [
+        f for f in glob.glob(os.path.join(user_dir, "**", "sessions-backup-*.json"), recursive=True)
+        if os.path.isfile(f)
+    ]
+    found += [
+        f for f in glob.glob(os.path.join(user_dir, "**", "state.vscdb*.bak-*"), recursive=True)
+        if os.path.isfile(f)
+    ]
+    return _unique_paths(found)
+
+
+def _list_search_indexes() -> List[str]:
+    """globalStorage 与各 workspace 下的会话搜索索引。"""
+    paths = [SEARCH_INDEX] + [
+        f for f in glob.glob(os.path.join(WORKSPACE_STORAGE, "*", "conversation-search.db"))
+        if os.path.isfile(f)
+    ]
+    return _unique_paths(paths)
+
+
+def scan_cleanup_targets() -> List[dict]:
+    """扫描可清理类目并统计占用字节数。只读，可安全地在后台线程执行。
+
+    返回每项 {key, label, size_bytes, files, note, default_on, requires_closed}。
+    """
+    targets: List[dict] = []
+
+    backup_files = _list_backup_files()
+    targets.append({
+        "key": "backups",
+        "label": "工具备份文件（会话级 .json / 旧 .bak-*）",
+        "size_bytes": sum(os.path.getsize(f) for f in backup_files),
+        "files": len(backup_files),
+        "note": "删除后无法再恢复会话，请确认不再需要",
+        "default_on": True,
+        "requires_closed": False,
+    })
+
+    index_files = _list_search_indexes()
+    targets.append({
+        "key": "search_index",
+        "label": "会话搜索索引 conversation-search.db",
+        "size_bytes": sum(os.path.getsize(f) for f in index_files),
+        "files": len(index_files),
+        "note": "Cursor 下次启动会自动重建",
+        "default_on": True,
+        "requires_closed": False,
+    })
+
+    vacuum_bytes = 0
+    vacuum_dbs = 0
+    for db_path in database_paths():
+        try:
+            con = open_db_ro(db_path)
+        except sqlite3.Error:
+            continue
+        try:
+            page_size = con.execute("PRAGMA page_size").fetchone()[0]
+            freelist = con.execute("PRAGMA freelist_count").fetchone()[0]
+            vacuum_bytes += page_size * freelist
+            vacuum_dbs += 1
+        except sqlite3.DatabaseError:
+            continue
+        finally:
+            con.close()
+    targets.append({
+        "key": "vacuum",
+        "label": "压缩会话数据库 (VACUUM)",
+        "size_bytes": vacuum_bytes,
+        "files": vacuum_dbs,
+        "note": "回收删除会话后留下的空洞，需要 Cursor 退出",
+        "default_on": True,
+        "requires_closed": True,
+    })
+
+    cache_files: List[str] = []
+    cache_bytes = 0
+    cursor_root = os.path.dirname(GLOBAL_STORAGE)  # %APPDATA%\Cursor
+    for name in CACHE_DIR_NAMES:
+        p = os.path.join(cursor_root, name)
+        if os.path.isdir(p):
+            cache_files.append(p)
+            cache_bytes += _dir_size(p)
+    targets.append({
+        "key": "cache_dirs",
+        "label": "Cursor 缓存/日志目录",
+        "size_bytes": cache_bytes,
+        "files": len(cache_files),
+        "note": "缓存会自动重建；logs 删除后旧日志不可追溯，需要 Cursor 退出",
+        "default_on": False,
+        "requires_closed": True,
+    })
+
+    return targets
+
+
+def run_cleanup(selected: Dict[str, bool]) -> Dict[str, int]:
+    """按勾选执行清理，返回 {key: 实际释放字节数}。
+
+    调用方负责前置 Cursor 退出检查；单个类目失败不阻断其余类目。
+    """
+    chosen = {k for k, v in selected.items() if v}
+    freed: Dict[str, int] = {}
+
+    if "backups" in chosen:
+        removed = 0
+        for f in _list_backup_files():
+            try:
+                removed += os.path.getsize(f)
+                os.remove(f)
+            except OSError:
+                continue
+        freed["backups"] = removed
+
+    if "search_index" in chosen:
+        removed = 0
+        for f in _list_search_indexes():
+            try:
+                removed += os.path.getsize(f)
+                os.remove(f)
+            except OSError:
+                continue
+        freed["search_index"] = removed
+
+    if "vacuum" in chosen:
+        freed["vacuum"] = 0
+        for db_path in database_paths():
+            try:
+                con = open_db_ro(db_path)
+                try:
+                    page_size = con.execute("PRAGMA page_size").fetchone()[0]
+                    reclaimable = page_size * con.execute("PRAGMA freelist_count").fetchone()[0]
+                finally:
+                    con.close()
+            except sqlite3.Error:
+                continue
+            if not reclaimable:
+                continue
+            try:
+                con = open_db_rw(db_path)
+                try:
+                    con.execute("VACUUM")
+                    con.commit()
+                finally:
+                    con.close()
+                freed["vacuum"] += reclaimable
+            except sqlite3.DatabaseError:
+                continue
+
+    if "cache_dirs" in chosen:
+        removed = 0
+        cursor_root = os.path.dirname(GLOBAL_STORAGE)
+        for name in CACHE_DIR_NAMES:
+            p = os.path.join(cursor_root, name)
+            if not os.path.isdir(p):
+                continue
+            size = _dir_size(p)
+            shutil.rmtree(p, ignore_errors=True)
+            removed += size if not os.path.exists(p) else 0
+        freed["cache_dirs"] = removed
+
+    return freed
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Windows 下用 Win32 API 写入剪贴板（CF_UNICODETEXT），无外部依赖。
+
+    OpenClipboard/EmptyClipboard/SetClipboardData/CloseClipboard 位于
+    user32.dll，内存分配在 kernel32.dll；两者不能混用同一个句柄。
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # 64 位进程下 HGLOBAL/HANDLE/LPVOID 是指针，必须声明 restype/argtypes，
+        # 否则 ctypes 按 32 位 c_int 截断返回值或转换参数，句柄会失效。
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HGLOBAL]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        data = (text + "\0").encode("utf-16-le")
+        if not user32.OpenClipboard(0):
+            return False
+        try:
+            user32.EmptyClipboard()
+            buf = kernel32.GlobalAlloc(0x0042, len(data))  # GHND = GMEM_MOVEABLE | GMEM_ZEROINIT
+            if not buf:
+                return False
+            locked = kernel32.GlobalLock(buf)
+            if locked:
+                ctypes.memmove(locked, data, len(data))
+                kernel32.GlobalUnlock(buf)
+            if not user32.SetClipboardData(13, buf):  # 13 = CF_UNICODETEXT
+                kernel32.GlobalFree(buf)
+                return False
+            return True
+        finally:
+            user32.CloseClipboard()
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 OPS = [
     ("preview", "扫描并分类会话", op_preview),
     ("delete-archived", "删除归档会话+残留+孤儿", op_delete_archived),
-    ("backup", "备份当前数据库", op_backup),
-    ("restore", "从备份恢复", op_restore),
+    ("backup-sessions", "备份指定会话为 JSON（--ids id1,id2）", op_backup_sessions),
+    ("restore-sessions", "从 JSON 备份恢复会话（--file 指定，否则列表选择）", op_restore_sessions),
     ("wipe-all", "清空全部会话（危险）", op_wipe_all),
     ("purge-index", "清理会话搜索索引", op_purge_index),
     ("repair-mirror", "修复 composerHeaders 镜像", op_repair_mirror),
@@ -1591,17 +2218,17 @@ def _tui_imports():
         from textual import on
         from textual.app import App, ComposeResult, RenderResult
         from textual.binding import Binding
-        from textual.containers import Horizontal, Vertical
+        from textual.containers import Horizontal, Vertical, VerticalScroll
         from textual.events import Click, Leave, MouseMove
         from textual.geometry import Offset, Size
         from textual.message import Message
         from textual.screen import ModalScreen, Screen
         from textual.scroll_view import ScrollView
-        from textual.widgets import Button, DataTable, Footer, Header, Label, MarkdownViewer, Static
+        from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Label, MarkdownViewer, Static
         from textual.worker import Worker, WorkerState
-        return (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical,
+        return (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
                 Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
-                Button, DataTable, Footer, Header, Label, MarkdownViewer, Static,
+                Button, Checkbox, DataTable, Footer, Header, Label, MarkdownViewer, Static,
                 on, Worker, WorkerState)
     except ImportError:
         return None
@@ -1622,9 +2249,9 @@ TUI_APP_CLASS = None  # 测试可引用
 
 
 def _build_app_class(mods):
-    (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical,
+    (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
      Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
-     Button, DataTable, Footer, Header, Label, MarkdownViewer, Static,
+     Button, Checkbox, DataTable, Footer, Header, Label, MarkdownViewer, Static,
      on, Worker, WorkerState) = mods
 
     STATUS_LABEL = {
@@ -1651,21 +2278,208 @@ def _build_app_class(mods):
             self.index = index
 
     class ConfirmModal(ModalScreen[bool]):
-        """删除前确认弹窗。"""
+        """确认弹窗（删除/清理等破坏性操作前使用）。"""
 
-        def __init__(self, message: str):
+        def __init__(self, message: str, confirm_label: str = "确认删除"):
             super().__init__()
             self._message = message
+            self._confirm_label = confirm_label
 
         def compose(self) -> ComposeResult:
             with Vertical(id="confirm-box"):
                 yield Label(self._message, id="confirm-text")
                 with Horizontal(id="confirm-btns"):
-                    yield Button("确认删除", variant="error", id="btn-yes")
+                    yield Button(self._confirm_label, variant="error", id="btn-yes")
                     yield Button("取消", variant="primary", id="btn-no")
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
             self.dismiss(event.button.id == "btn-yes")
+
+    class CleanupScreen(Screen[None]):
+        """磁盘清理面板：列出可清理类目与占用，勾选后执行。
+
+        占用扫描走后台 worker（缓存目录递归统计可能较慢）；执行清理
+        也在 worker 线程完成，完成后自动返回主界面。
+        """
+
+        BINDINGS = [
+            Binding("escape", "close", "返回"),
+            Binding("q", "close", "返回"),
+        ]
+
+        CSS = """
+        #cleanup-status { height: 1; background: $panel; color: $text; padding: 0 1; }
+        #cleanup-list { height: 1fr; padding: 0 1; }
+        /* Checkbox 默认 tall 边框 + padding 占 3 行高，4 个类目在小终端
+           里会被挤出可视区；压缩成单行，标签/大小/说明同一行显示。 */
+        #cleanup-list Checkbox {
+            border: none;
+            padding: 0 1;
+            min-height: 1;
+            height: 1;
+        }
+        .cleanup-size { width: 12; text-align: right; color: $text-muted; }
+        .cleanup-note { width: 1fr; color: $text-muted; }
+        #cleanup-actions { height: 3; padding: 0 1; align: left middle; }
+        #cleanup-actions Button { margin-right: 1; }
+        #cleanup-foot { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._targets: List[dict] = []
+            self._selected: Set[str] = set()
+            self._cursor_running = cursor_running()
+            self._scan_worker: Optional[Worker] = None
+            self._run_worker: Optional[Worker] = None
+
+        def compose(self) -> ComposeResult:
+            yield Header(show_clock=True)
+            yield Static("正在扫描磁盘占用…", id="cleanup-status")
+            with VerticalScroll(id="cleanup-list"):
+                yield Label("扫描中…", id="cleanup-empty")
+            with Horizontal(id="cleanup-actions"):
+                yield Button("全部勾选", id="ck-all")
+                yield Button("取消勾选", id="ck-none")
+                yield Button("执行清理", variant="error", id="ck-run")
+            yield Static(
+                "[空格]勾选/取消  [q/esc]返回 — 需退出 Cursor 的类目在运行中会禁用",
+                id="cleanup-foot",
+            )
+
+        def on_mount(self) -> None:
+            self._scan_worker = self.run_worker(
+                scan_cleanup_targets, thread=True, exit_on_error=False
+            )
+
+        def _render_targets(self) -> None:
+            """按扫描结果重建类目列表（单行：勾选框 + 大小 + 说明）。
+
+            嵌套结构通过容器构造器传 children 一次性构建，再由
+            mount_all 递归挂载；不能对未挂载的节点单独调用 mount。
+            """
+            container = self.query_one("#cleanup-list", VerticalScroll)
+            container.remove_children()
+            items: List[Any] = []
+            for t in self._targets:
+                key = t["key"]
+                disabled = bool(t["requires_closed"] and self._cursor_running)
+                if disabled:
+                    self._selected.discard(key)
+                # 禁用的类目在 label 上直接标注原因，避免依赖深色样式区分。
+                label = t["label"] + ("（需退出 Cursor）" if disabled else "")
+                cb = Checkbox(
+                    label,
+                    id=f"ck-{key}",
+                    value=key in self._selected,
+                    disabled=disabled,
+                )
+                size = Static(_fmt_bytes(t["size_bytes"]), classes="cleanup-size")
+                note = Label(t["note"], classes="cleanup-note")
+                items.append(Horizontal(cb, size, note))
+            container.mount_all(items)
+
+        def _update_status(self) -> None:
+            total = sum(t["size_bytes"] for t in self._targets if t["key"] in self._selected)
+            self.query_one("#cleanup-status", Static).update(
+                f"可清理 {len(self._targets)} 类  |  已勾选 {len(self._selected)} 项，"
+                f"预计释放 {_fmt_bytes(total)}"
+            )
+
+        def _sync_checkboxes(self) -> None:
+            """把全选/取消全选的结果同步到各 Checkbox（禁用的跳过）。"""
+            for t in self._targets:
+                key = t["key"]
+                cb = self.query_one(f"#ck-{key}", Checkbox)
+                if not cb.disabled and cb.value != (key in self._selected):
+                    cb.value = key in self._selected
+            self._update_status()
+
+        def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+            key = (event.checkbox.id or "").removeprefix("ck-")
+            if key in {t["key"] for t in self._targets}:
+                if event.value:
+                    self._selected.add(key)
+                else:
+                    self._selected.discard(key)
+            self._update_status()
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            bid = event.button.id or ""
+            if bid == "ck-all":
+                self._selected = {t["key"] for t in self._targets}
+                self._sync_checkboxes()
+            elif bid == "ck-none":
+                self._selected.clear()
+                self._sync_checkboxes()
+            elif bid == "ck-run":
+                self._ask_run()
+
+        def _ask_run(self) -> None:
+            if self._run_worker is not None:
+                self.notify("清理正在进行中…", timeout=2)
+                return
+            if not self._selected:
+                self.notify("没有勾选任何类目", timeout=3)
+                return
+            total = sum(t["size_bytes"] for t in self._targets if t["key"] in self._selected)
+            lines = [f"将清理 {len(self._selected)} 项，预计释放 {_fmt_bytes(total)}："]
+            lines += [
+                f"  - {t['label']}: {_fmt_bytes(t['size_bytes'])}"
+                + (f"（{t['note']}）" if t.get("note") else "")
+                for t in self._targets
+                if t["key"] in self._selected
+            ]
+            self.app.push_screen(
+                ConfirmModal("\n".join(lines), confirm_label="确认清理"), self._run
+            )
+
+        def _run(self, result: bool) -> None:
+            if not result:
+                self.notify("已取消", timeout=2)
+                return
+            if self._selected & CLEANUP_NEEDS_CLOSED and cursor_running():
+                self.notify("所选类目需要 Cursor 完全退出才能清理", severity="error", timeout=5)
+                return
+            chosen = {key: True for key in self._selected}
+            self.query_one("#cleanup-status", Static).update("正在清理…")
+            self._run_worker = self.run_worker(
+                lambda: run_cleanup(chosen), thread=True, exit_on_error=False
+            )
+
+        @on(Worker.StateChanged)
+        def on_worker_state_changed(self, event: "Worker.StateChanged") -> None:
+            # 注意：PENDING/RUNNING 状态也会派发本事件，worker 引用只在
+            # SUCCESS/ERROR 终止状态时清空，否则后续事件会因 is 判断失败
+            # 而丢失（参照 ChatScreen 的 worker 回调结构）。
+            if event.worker is self._scan_worker:
+                if event.state == WorkerState.SUCCESS:
+                    self._targets = event.worker.result or []
+                    self._selected = {t["key"] for t in self._targets if t["default_on"]}
+                    self._render_targets()
+                    self._update_status()
+                    self._scan_worker = None
+                elif event.state == WorkerState.ERROR:
+                    self.notify(f"扫描失败: {event.worker.error}", severity="error", timeout=5)
+                    self._scan_worker = None
+            elif event.worker is self._run_worker:
+                if event.state == WorkerState.SUCCESS:
+                    freed = event.worker.result or {}
+                    total = sum(freed.values())
+                    detail = "，".join(
+                        f"{t['label']} {_fmt_bytes(freed[t['key']])}"
+                        for t in self._targets
+                        if freed.get(t["key"])
+                    )
+                    self.notify(f"清理完成: 释放 {_fmt_bytes(total)}（{detail}）", timeout=6)
+                    self.dismiss(None)
+                    self._run_worker = None
+                elif event.state == WorkerState.ERROR:
+                    self.notify(f"清理失败: {event.worker.error}", severity="error", timeout=5)
+                    self._run_worker = None
+
+        def action_close(self) -> None:
+            self.dismiss(None)
 
     class UserIndexRail(ScrollView):
         """右侧用户输入索引轨道：圆点 + 虚线连接，可独立滚动。
@@ -1939,8 +2753,10 @@ def _build_app_class(mods):
             Binding("a", "select_all", "全选当前筛选"),
             Binding("n", "select_none", "取消全选"),
             Binding("v", "view_chat", "查看聊天"),
+            Binding("c", "copy_id", "复制ID"),
             Binding("d", "delete_selected", "删除勾选"),
             Binding("b", "do_backup", "备份"),
+            Binding("x", "open_cleanup", "磁盘清理"),
             Binding("r", "refresh", "刷新"),
             Binding("q", "quit", "退出"),
         ]
@@ -1977,6 +2793,7 @@ def _build_app_class(mods):
             self._last_fingerprint: Optional[Tuple[Tuple[str, float, int], ...]] = None
             self._chat_worker: Optional[Worker] = None
             self._chat_title: Optional[str] = None
+            self._backup_worker: Optional[Worker] = None
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
@@ -2121,7 +2938,7 @@ def _build_app_class(mods):
                 f"Cursor: {running}  |  库 {size:.1f} MB  |  会话 {total}（归档 {arch} / 残留 {mirror} / 孤儿 {orphan}）  |  已勾选 {sel}"
             )
             self.query_one("#foot-hint", Static).update(
-                "[空格]勾选  [a]全选当前  [n]取消全选  [r]刷新  [v]查看聊天  [d]删除勾选  [b]备份  [q]退出"
+                "[空格]勾选 [a]全选 [n]取消 [v]聊天 [c]复制ID [d]删除 [b]备份 [x]磁盘清理 [r]刷新 [q]退出"
             )
 
         def set_filter_buttons(self) -> None:
@@ -2215,12 +3032,44 @@ def _build_app_class(mods):
             self.rebuild_table()
 
         def action_do_backup(self) -> None:
-            made = backup()
-            self.notify(f"已备份 {len(made)} 个文件", timeout=3)
+            if not self.selected:
+                self.notify("没有勾选任何会话（先空格勾选，再按 b 备份）", timeout=3)
+                return
+            if self._backup_worker is not None:
+                self.notify("备份正在进行中…", timeout=2)
+                return
+            selected_sessions = [s for s in self.sessions if s.composer_id in self.selected]
+            self._backup_worker = self.run_worker(
+                lambda: backup_sessions(selected_sessions), thread=True, exit_on_error=False
+            )
+            self.notify(f"正在备份 {len(selected_sessions)} 个会话…", timeout=3)
 
         def action_refresh(self) -> None:
             if self.refresh_data(force=True):
                 self.notify("已刷新会话列表", timeout=2)
+
+        def action_copy_id(self) -> None:
+            """把当前行的完整会话 ID 复制到剪贴板（表格 ID 列只显示前 13 位）。"""
+            if not self.current_row:
+                self.notify("先选中一行再复制（↑↓ 移动高亮）", timeout=3)
+                return
+            cid = self.row_to_id.get(self.current_row)
+            if cid is None:
+                return
+            if _copy_to_clipboard(cid):
+                self.notify(f"已复制会话 ID: {cid}", timeout=4)
+            else:
+                self.notify("复制失败：剪贴板不可用", severity="error", timeout=3)
+
+        def action_open_cleanup(self) -> None:
+            # 聊天查看器打开时 x 不应冒泡进来；面板已在台上时也不重复压入。
+            if isinstance(self.screen, (ChatScreen, CleanupScreen)):
+                return
+            self.push_screen(CleanupScreen(), callback=self._on_cleanup_closed)
+
+        def _on_cleanup_closed(self, _result: None) -> None:
+            # VACUUM/缓存清理会改变库文件大小，返回后刷新列表与状态栏。
+            self.refresh_data()
 
         def action_view_chat(self) -> None:
             # v 是 CleanerApp 的全局快捷键。打开聊天记录后，按键事件仍
@@ -2257,7 +3106,23 @@ def _build_app_class(mods):
 
         @on(Worker.StateChanged)
         def on_worker_state_changed(self, event: "Worker.StateChanged") -> None:
-            """聊天详情 worker 结束时在主线程打开查看器/提示错误。"""
+            """聊天详情/备份 worker 结束时在主线程处理结果。"""
+            if event.worker is self._backup_worker:
+                if event.state == WorkerState.SUCCESS:
+                    worker = self._backup_worker
+                    self._backup_worker = None
+                    out_path = worker.result if isinstance(worker.result, str) else ""
+                    self.notify(
+                        f"备份完成: {os.path.basename(out_path) if out_path else '未知文件'}",
+                        timeout=5,
+                    )
+                elif event.state == WorkerState.ERROR:
+                    worker = self._backup_worker
+                    self._backup_worker = None
+                    self.notify(f"备份失败: {worker.error}", severity="error", timeout=5)
+                elif event.state == WorkerState.CANCELLED:
+                    self._backup_worker = None
+                return
             if event.worker is not self._chat_worker:
                 return
             if event.state == WorkerState.SUCCESS:
@@ -2288,7 +3153,7 @@ def _build_app_class(mods):
             keys = sum(s.content_keys for s in selected_sessions)
             msg = (f"将删除 {len(selected_sessions)} 个会话\n"
                    f"（归档 {arch} / 镜像残留 {mirror} / 孤儿 {orphan}），正文键 {keys} 个\n"
-                   f"删除前自动备份，且要求 Cursor 已退出。")
+                   f"删除前不会自动备份，建议先按 b 备份勾选会话；且要求 Cursor 已退出。")
 
             def _ask(result: bool) -> None:
                 if not result:
@@ -2297,7 +3162,6 @@ def _build_app_class(mods):
                 if cursor_running():
                     self.notify("Cursor 正在运行！请先完全退出再删除。", severity="error", timeout=5)
                     return
-                made = backup()
                 try:
                     stats = delete_sessions(selected_sessions)
                 except Exception as e:
@@ -2306,7 +3170,7 @@ def _build_app_class(mods):
                 self.selected.clear()
                 self.refresh_data()
                 self.notify(
-                    f"完成: 会话 {stats['sessions']}，镜像 {stats['mirror'][0]}→{stats['mirror'][1]}，正文键 {stats['keys']}（备份: {os.path.basename(made[0]) if made else '无'}）",
+                    f"完成: 会话 {stats['sessions']}，镜像 {stats['mirror'][0]}→{stats['mirror'][1]}，正文键 {stats['keys']}",
                     timeout=6,
                 )
 
@@ -2325,6 +3189,8 @@ def main():
     ap.add_argument("--op", choices=[n for n, _, _ in OPS], help="直接执行 CLI 操作，跳过 TUI")
     ap.add_argument("--yes", action="store_true", help="跳过确认提示（配合 --op）")
     ap.add_argument("--force", action="store_true", help="跳过 Cursor 运行检测")
+    ap.add_argument("--ids", help="备份/操作指定的会话 ID，逗号分隔（配合 --op backup-sessions）")
+    ap.add_argument("--file", help="指定备份文件路径（配合 --op restore-sessions）")
     ap.add_argument("--db", help=r"指定 state.vscdb 路径（默认 %%APPDATA%%\Cursor\...；测试用）")
     args = ap.parse_args()
 
