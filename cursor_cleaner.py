@@ -104,6 +104,7 @@ S_ARCHIVED = "archived"
 S_ACTIVE = "active"
 S_MIRROR_ONLY = "mirror-only"
 S_CONTENT_ONLY = "content-only"
+_DELETE_RESIDUAL_STATUSES = frozenset((S_ARCHIVED, S_MIRROR_ONLY, S_CONTENT_ONLY))
 
 
 # =====================================================================
@@ -768,6 +769,39 @@ def classify(sessions: List[Session], include_hidden: bool = False) -> Dict[str,
             continue
         out[s.status].append(s)
     return out
+
+
+def _session_group_key(session: Session) -> Optional[Tuple[str, str]]:
+    name = _session_group_name(session.name)
+    if not name:
+        return None
+    return (_workspace_identity(session.workspace_id), name)
+
+
+def expand_delete_targets(selected: List[Session], all_sessions: List[Session]) -> List[Session]:
+    """扩展删除目标：勾选会话、同组隐藏空副本和隐藏残留。"""
+    if not selected:
+        return []
+
+    selected_ids = {session.composer_id for session in selected}
+    selected_groups = {
+        group_key
+        for session in selected
+        if (group_key := _session_group_key(session)) is not None
+    }
+
+    def should_delete(session: Session) -> bool:
+        if session.composer_id in selected_ids:
+            return True
+        if session.hidden and session.status in _DELETE_RESIDUAL_STATUSES:
+            return True
+        return (
+            session.hidden
+            and not session.has_content
+            and _session_group_key(session) in selected_groups
+        )
+
+    return [session for session in all_sessions if should_delete(session)]
 
 
 def count_keys_for(con: sqlite3.Connection, cid: str) -> int:
@@ -3742,14 +3776,51 @@ def _build_app_class(mods):
             if not self.selected:
                 self.notify("没有勾选任何会话", timeout=3)
                 return
-            selected_sessions = [s for s in self.sessions if s.composer_id in self.selected]
-            arch = sum(1 for s in selected_sessions if s.status == S_ARCHIVED)
-            mirror = sum(1 for s in selected_sessions if s.status == S_MIRROR_ONLY)
-            orphan = sum(1 for s in selected_sessions if s.status == S_CONTENT_ONLY)
-            keys = sum(s.content_keys for s in selected_sessions)
-            msg = (f"将删除 {len(selected_sessions)} 个会话\n"
-                   f"（归档 {arch} / 镜像残留 {mirror} / 孤儿 {orphan}），正文键 {keys} 个\n"
-                   f"删除前不会自动备份，建议先按 b 备份勾选会话；且要求 Cursor 已退出。")
+            try:
+                all_sessions = scan(include_hidden=True)
+            except Exception as e:
+                self.notify(f"扫描失败: {e}", severity="error", timeout=5)
+                return
+
+            selected_ids = set(self.selected)
+            selected_sessions = [s for s in all_sessions if s.composer_id in selected_ids]
+            targets = expand_delete_targets(selected_sessions, all_sessions)
+            if not targets:
+                self.selected.clear()
+                self.refresh_data(force=True)
+                self.notify("勾选的会话已不存在", timeout=3)
+                return
+
+            selected_arch = sum(1 for s in selected_sessions if s.status == S_ARCHIVED)
+            selected_mirror = sum(1 for s in selected_sessions if s.status == S_MIRROR_ONLY)
+            selected_orphan = sum(1 for s in selected_sessions if s.status == S_CONTENT_ONLY)
+            selected_group_keys = {
+                group_key
+                for s in selected_sessions
+                if (group_key := _session_group_key(s)) is not None
+            }
+            selected_ids = {s.composer_id for s in selected_sessions}
+            hidden_targets = [s for s in targets if s.composer_id not in selected_ids]
+            hidden_arch = sum(1 for s in hidden_targets if s.status == S_ARCHIVED)
+            hidden_mirror = sum(1 for s in hidden_targets if s.status == S_MIRROR_ONLY)
+            hidden_orphan = sum(1 for s in hidden_targets if s.status == S_CONTENT_ONLY)
+            hidden_group = sum(
+                1
+                for s in hidden_targets
+                if (
+                    s.status not in _DELETE_RESIDUAL_STATUSES
+                    and not s.has_content
+                    and _session_group_key(s) in selected_group_keys
+                )
+            )
+            keys = sum(s.content_keys for s in targets)
+            msg = (
+                f"将删除 {len(targets)} 个会话\n"
+                f"勾选 {len(selected_sessions)} 个（归档 {selected_arch} / 镜像残留 {selected_mirror} / 孤儿 {selected_orphan}）\n"
+                f"+ 隐藏残留 {len(hidden_targets)} 个（归档占位 {hidden_arch} / 镜像残留 {hidden_mirror} / 孤儿 {hidden_orphan} / 同组空副本 {hidden_group}）\n"
+                f"正文键 {keys} 个\n"
+                f"删除前不会自动备份，建议先按 b 备份勾选会话；且要求 Cursor 已退出。"
+            )
 
             def _ask(result: bool) -> None:
                 if not result:
@@ -3759,7 +3830,7 @@ def _build_app_class(mods):
                     self.notify("Cursor 正在运行！请先完全退出再删除。", severity="error", timeout=5)
                     return
                 try:
-                    stats = delete_sessions(selected_sessions)
+                    stats = delete_sessions(targets)
                 except Exception as e:
                     self.notify(f"删除失败: {e}", severity="error", timeout=5)
                     return
