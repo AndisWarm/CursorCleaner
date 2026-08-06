@@ -47,6 +47,8 @@ import zlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+import conversation_markdown_formatter
+
 def _configure_utf8_console() -> None:
     """统一 Windows 控制台及标准输入/输出编码，避免 Codex/PowerShell 乱码。"""
     if sys.platform.startswith("win"):
@@ -1538,13 +1540,16 @@ def export_conversation_md(cid: str, name: str, msgs: List[dict], out_path: str)
     """把会话导出为 Markdown 文件，返回最终绝对路径。
 
     out_path 为相对路径时基于当前工作目录；父目录不存在会自动创建。
+
+    Markdown 内容由 conversation_markdown_formatter 在写入前生成：
+    原始对话数据 -> 消息列表 -> 美化模块 -> Markdown 字符串 -> 写文件。
     """
     target = os.path.abspath(out_path)
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(target, "w", encoding="utf-8") as f:
-        f.write(fmt_conversation_markdown(cid, name, msgs))
+        f.write(conversation_markdown_formatter.format_conversation_markdown(name, msgs))
     return target
 
 
