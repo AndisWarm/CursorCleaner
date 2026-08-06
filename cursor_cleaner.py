@@ -1437,6 +1437,65 @@ def fmt_conversation_markdown(cid: str, name: str = "",
     return "\n".join(lines)
 
 
+# ---- 文本选择的 cell 坐标工具（ChatLog 自定义 render 需要自行实现
+# textual 的 get_selection 协议；坐标按终端格计，中文占 2 格） ----
+
+
+def _cell_to_char_index(text: str, cell_col: int) -> int:
+    """把 cell 列（终端格）换算为字符索引，宽字符按实际格宽累计。"""
+    from rich.cells import cell_len
+
+    if cell_col <= 0:
+        return 0
+    width = 0
+    for i, ch in enumerate(text):
+        w = cell_len(ch)
+        if width + w > cell_col:
+            return i
+        width += w
+    return len(text)
+
+
+def _cell_slice(text: str, start_cell: int, end_cell: Optional[int]) -> str:
+    i0 = _cell_to_char_index(text, start_cell)
+    i1 = len(text) if end_cell is None else _cell_to_char_index(text, end_cell)
+    return text[i0:i1]
+
+
+def _extract_cell_range(lines: List[str], start: Optional[Tuple[int, int]],
+                        end: Optional[Tuple[int, int]]) -> str:
+    """从行列表按 (行, cell列) 区间提取文本；None 端表示到该侧边缘。"""
+    if not lines:
+        return ""
+    from rich.cells import cell_len
+
+    s_line, s_cell = start if start is not None else (0, 0)
+    e_line, e_cell = end if end is not None else (len(lines) - 1, cell_len(lines[-1]))
+    e_line = min(e_line, len(lines) - 1)
+    if s_line > e_line:
+        return ""
+    if s_line == e_line:
+        return _cell_slice(lines[s_line], s_cell, e_cell)
+    parts = [_cell_slice(lines[s_line], s_cell, None)]
+    parts.extend(lines[s_line + 1:e_line])
+    parts.append(_cell_slice(lines[e_line], 0, e_cell))
+    return "\n".join(parts)
+
+
+def _selection_row_span(row: int, row_width: int,
+                        start: Optional[Tuple[int, int]],
+                        end: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    """选区在第 row 行上的 cell 区间 [c0, c1)，无交集返回 None。"""
+    s_line, s_cell = start if start is not None else (0, 0)
+    e_line, e_cell = end if end is not None else (1 << 30, row_width)
+    if row < s_line or row > e_line:
+        return None
+    c0 = s_cell if row == s_line else 0
+    c1 = e_cell if row == e_line else row_width
+    c1 = min(c1, row_width)
+    return (c0, c1) if c1 > c0 else None
+
+
 def _sanitize_filename(name: str) -> str:
     """清洗为 Windows 合法文件名片段：非法字符替换为 _，去首尾空格/点。"""
     cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
@@ -2871,6 +2930,7 @@ def _build_app_class(mods):
             self._title = title
             self._current_user = -1    # 视口内高亮圆点下标
             self._rebuild_worker: Optional[Worker] = None
+            self._selection = None     # textual 选择系统同步过来的选区
             self.virtual_size = Size(layout.width, layout.total_lines)
 
         # ---- 布局 ----
@@ -2923,6 +2983,40 @@ def _build_app_class(mods):
             elif event.state in (WorkerState.ERROR, WorkerState.CANCELLED):
                 self._rebuild_worker = None
 
+        # ---- 文本选择（自定义 render 必须自行实现选择协议） ----
+
+        def _viewport_range(self) -> Tuple[int, int]:
+            """当前视口覆盖的排版行区间 [sy, sy+height)。"""
+            sy = min(int(self.scroll_y), max(0, self._layout.total_lines - 1))
+            return sy, max(1, self.size.height)
+
+        def _viewport_plain_lines(self) -> List[str]:
+            """视口内各行的纯文本（去 markup），与屏幕行一一对应。"""
+            from rich.text import Text
+
+            lines = self._layout.lines
+            if not lines:
+                return []
+            sy, height = self._viewport_range()
+            return [Text.from_markup(line).plain for line in lines[sy: sy + height]]
+
+        def get_selection(self, selection) -> "Optional[Tuple[str, str]]":
+            """textual 选择系统回调：把选区 cell 坐标映射到视口纯文本。
+
+            选区坐标是视口相对的 (行, cell列)；中文按 2 格换算字符索引。
+            """
+            plain = self._viewport_plain_lines()
+            if not plain:
+                return None
+            start = selection.start.transpose if selection.start is not None else None
+            end = selection.end.transpose if selection.end is not None else None
+            text = _extract_cell_range(plain, start, end)
+            return (text, "\n") if text else None
+
+        def selection_updated(self, selection) -> None:
+            self._selection = selection
+            self.refresh()
+
         # ---- 渲染（虚拟化：只生成视口内的行） ----
 
         def render(self) -> RenderResult:
@@ -2930,14 +3024,29 @@ def _build_app_class(mods):
             total = self._layout.total_lines
             if not lines:
                 return ""
-            sy = min(int(self.scroll_y), max(0, total - 1))
-            height = max(1, self.size.height)
+            sy, height = self._viewport_range()
             # 每行用 Rich Text 编译（支持 [b]/[i]/[dim] 等标记），
             # 只编译视口内的行，成本与消息总数无关。
+            from rich.cells import cell_len
             from rich.console import Group
             from rich.text import Text
 
-            return Group(*(Text.from_markup(line) for line in lines[sy : sy + height]))
+            sel = self._selection
+            sel_start = sel.start.transpose if sel is not None and sel.start is not None else None
+            sel_end = sel.end.transpose if sel is not None and sel.end is not None else None
+
+            rendered: List[Text] = []
+            for row, line in enumerate(lines[sy: sy + height]):
+                text = Text.from_markup(line)
+                if sel is not None:
+                    span = _selection_row_span(row, cell_len(text.plain), sel_start, sel_end)
+                    if span is not None:
+                        i0 = _cell_to_char_index(text.plain, span[0])
+                        i1 = _cell_to_char_index(text.plain, span[1])
+                        if i1 > i0:
+                            text.stylize("reverse", i0, i1)
+                rendered.append(text)
+            return Group(*rendered)
 
         # ---- 圆点高亮（滚动事件驱动，替代原先 0.15s 轮询） ----
 
