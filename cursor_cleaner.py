@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Cursor 会话清理工具（TUI + CLI）
+Cursor 会话清理工具（TUI）
 
-TUI 用法:
+日常使用（TUI 终端界面）:
     python cursor_cleaner.py
 
-CLI 用法（自动化/测试）:
+自动化/测试接口（--op 仅供测试与自动化脚本使用，日常维护请用 TUI）:
     python cursor_cleaner.py --op preview
     python cursor_cleaner.py --op delete-archived --yes
     python cursor_cleaner.py --op backup-sessions --ids <id1>,<id2>
@@ -16,8 +16,6 @@ CLI 用法（自动化/测试）:
     delete-archived 删除已归档会话 + 镜像残留 + 正文孤儿（核心功能）
     backup-sessions 备份指定会话为 JSON 存档（--ids 逗号分隔）
     restore-sessions 从 JSON 存档恢复会话（--file 指定，否则列表选择）
-    wipe-all        清空全部会话（危险）
-    purge-index     清理会话搜索索引 conversation-search.db
     repair-mirror   修复 composerHeaders 镜像
 
 数据模型（state.vscdb）:
@@ -2251,31 +2249,6 @@ def op_restore_sessions(args):
           f"镜像 {stats['mirror_added']}，正文键 {stats['kv_added']}，跳过已存在 {stats['skipped']}")
 
 
-def op_wipe_all(args):
-    sessions = scan(include_hidden=True)
-    if not sessions:
-        print("数据库为空。")
-        return
-    print(f"将清空全部会话（共 {len(sessions)} 条，含未归档），此操作不可逆！")
-    print("本操作不自动备份，如需留档请先运行 backup-sessions --ids 或 TUI 按 b 备份。")
-    if not args.yes and input("确认清空全部会话？[y/N] ").strip().lower() != "y":
-        print("已取消。")
-        return
-    require_closed(args.force)
-    stats = delete_sessions(sessions)
-    print(f"完成: 会话 {stats['sessions']}，表行 {stats['table_rows']}，"
-          f"镜像 {stats['mirror'][0]} -> {stats['mirror'][1]}，正文键 {stats['keys']}")
-
-
-def op_purge_index(_args):
-    if not os.path.exists(SEARCH_INDEX):
-        print("没有找到搜索索引，无需清理。")
-        return
-    require_closed(False)
-    os.remove(SEARCH_INDEX)
-    print(f"已删除 {SEARCH_INDEX}，Cursor 下次启动会自动重建。")
-
-
 def op_repair_mirror(args):
     """修复活动会话未出现在 composer 镜像中的情况。"""
     require_closed(args.force)
@@ -2563,8 +2536,6 @@ OPS = [
     ("delete-archived", "删除归档会话+残留+孤儿", op_delete_archived),
     ("backup-sessions", "备份指定会话为 JSON（--ids id1,id2）", op_backup_sessions),
     ("restore-sessions", "从 JSON 备份恢复会话（--file 指定，否则列表选择）", op_restore_sessions),
-    ("wipe-all", "清空全部会话（危险）", op_wipe_all),
-    ("purge-index", "清理会话搜索索引", op_purge_index),
     ("repair-mirror", "修复 composerHeaders 镜像", op_repair_mirror),
 ]
 
@@ -3810,8 +3781,8 @@ def _build_app_class(mods):
 
 def main():
     global DB, SEARCH_INDEX, DB_DISCOVERY_ENABLED
-    ap = argparse.ArgumentParser(description="Cursor 会话维护工具（TUI / CLI）")
-    ap.add_argument("--op", choices=[n for n, _, _ in OPS], help="直接执行 CLI 操作，跳过 TUI")
+    ap = argparse.ArgumentParser(description="Cursor 会话维护工具（默认进入 TUI；--op 仅供测试/自动化脚本使用）")
+    ap.add_argument("--op", choices=[n for n, _, _ in OPS], help="执行测试/自动化操作，跳过 TUI（日常使用请勿依赖）")
     ap.add_argument("--yes", action="store_true", help="跳过确认提示（配合 --op）")
     ap.add_argument("--force", action="store_true", help="跳过 Cursor 运行检测")
     ap.add_argument("--ids", help="备份/操作指定的会话 ID，逗号分隔（配合 --op backup-sessions）")
