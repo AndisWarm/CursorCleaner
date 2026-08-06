@@ -1437,6 +1437,85 @@ def fmt_conversation_markdown(cid: str, name: str = "",
     return "\n".join(lines)
 
 
+# ---- 文本选择的 cell 坐标工具（ChatLog 自定义 render 需要自行实现
+# textual 的 get_selection 协议；坐标按终端格计，中文占 2 格） ----
+
+
+def _cell_to_char_index(text: str, cell_col: int) -> int:
+    """把 cell 列（终端格）换算为字符索引，宽字符按实际格宽累计。"""
+    from rich.cells import cell_len
+
+    if cell_col <= 0:
+        return 0
+    width = 0
+    for i, ch in enumerate(text):
+        w = cell_len(ch)
+        if width + w > cell_col:
+            return i
+        width += w
+    return len(text)
+
+
+def _cell_slice(text: str, start_cell: int, end_cell: Optional[int]) -> str:
+    i0 = _cell_to_char_index(text, start_cell)
+    i1 = len(text) if end_cell is None else _cell_to_char_index(text, end_cell)
+    return text[i0:i1]
+
+
+def _extract_cell_range(lines: List[str], start: Optional[Tuple[int, int]],
+                        end: Optional[Tuple[int, int]]) -> str:
+    """从行列表按 (行, cell列) 区间提取文本；None 端表示到该侧边缘。"""
+    if not lines:
+        return ""
+    from rich.cells import cell_len
+
+    s_line, s_cell = start if start is not None else (0, 0)
+    e_line, e_cell = end if end is not None else (len(lines) - 1, cell_len(lines[-1]))
+    e_line = min(e_line, len(lines) - 1)
+    if s_line > e_line:
+        return ""
+    if s_line == e_line:
+        return _cell_slice(lines[s_line], s_cell, e_cell)
+    parts = [_cell_slice(lines[s_line], s_cell, None)]
+    parts.extend(lines[s_line + 1:e_line])
+    parts.append(_cell_slice(lines[e_line], 0, e_cell))
+    return "\n".join(parts)
+
+
+def _selection_row_span(row: int, row_width: int,
+                        start: Optional[Tuple[int, int]],
+                        end: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    """选区在第 row 行上的 cell 区间 [c0, c1)，无交集返回 None。"""
+    s_line, s_cell = start if start is not None else (0, 0)
+    e_line, e_cell = end if end is not None else (1 << 30, row_width)
+    if row < s_line or row > e_line:
+        return None
+    c0 = s_cell if row == s_line else 0
+    c1 = e_cell if row == e_line else row_width
+    c1 = min(c1, row_width)
+    return (c0, c1) if c1 > c0 else None
+
+
+def _sanitize_filename(name: str) -> str:
+    """清洗为 Windows 合法文件名片段：非法字符替换为 _，去首尾空格/点。"""
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    return cleaned[:60] or "会话"
+
+
+def export_conversation_md(cid: str, name: str, msgs: List[dict], out_path: str) -> str:
+    """把会话导出为 Markdown 文件，返回最终绝对路径。
+
+    out_path 为相对路径时基于当前工作目录；父目录不存在会自动创建。
+    """
+    target = os.path.abspath(out_path)
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(fmt_conversation_markdown(cid, name, msgs))
+    return target
+
+
 def remove_keys_for(con: sqlite3.Connection, cid: str) -> int:
     """删除一个会话的所有正文键，返回删除行数。"""
     if not _table_exists(con, "cursorDiskKV"):
@@ -2518,16 +2597,16 @@ def _tui_imports():
         from textual.app import App, ComposeResult, RenderResult
         from textual.binding import Binding
         from textual.containers import Horizontal, Vertical, VerticalScroll
-        from textual.events import Click, Leave, MouseMove
+        from textual.events import Click, Leave, MouseDown, MouseMove, MouseUp
         from textual.geometry import Offset, Size
         from textual.message import Message
         from textual.screen import ModalScreen, Screen
         from textual.scroll_view import ScrollView
-        from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Label, Static
+        from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, Static
         from textual.worker import Worker, WorkerState
         return (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
-                Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
-                Button, Checkbox, DataTable, Footer, Header, Label, Static,
+                Click, Leave, MouseDown, MouseMove, MouseUp, Offset, Size, Message, ModalScreen, Screen, ScrollView,
+                Button, Checkbox, DataTable, Footer, Header, Input, Label, Static,
                 on, Worker, WorkerState)
     except ImportError:
         return None
@@ -2549,8 +2628,8 @@ TUI_APP_CLASS = None  # 测试可引用
 
 def _build_app_class(mods):
     (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
-     Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
-     Button, Checkbox, DataTable, Footer, Header, Label, Static,
+     Click, Leave, MouseDown, MouseMove, MouseUp, Offset, Size, Message, ModalScreen, Screen, ScrollView,
+     Button, Checkbox, DataTable, Footer, Header, Input, Label, Static,
      on, Worker, WorkerState) = mods
 
     STATUS_LABEL = {
@@ -2610,6 +2689,35 @@ def _build_app_class(mods):
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
             self.dismiss(event.button.id == "btn-yes")
+
+    class ExportModal(ModalScreen[Optional[str]]):
+        """导出路径输入弹窗：Enter 确认返回路径，Esc 取消返回 None。
+
+        Esc 必须走 BINDINGS（命中即消费事件）；key_escape 方法不会阻止
+        事件传播，dismiss 后同一个 Esc 会继续命中 ChatScreen 的
+        escape→close，把聊天页一起关掉。
+        """
+
+        BINDINGS = [Binding("escape", "cancel", "", show=False)]
+
+        def __init__(self, default_path: str):
+            super().__init__()
+            self._default_path = default_path
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="export-box"):
+                yield Label("导出为 Markdown（Enter 确认，Esc 取消）：", id="export-text")
+                yield Input(value=self._default_path, id="export-input")
+
+        def on_mount(self) -> None:
+            self.query_one("#export-input", Input).focus()
+
+        def on_input_submitted(self, event: "Input.Submitted") -> None:
+            value = event.value.strip()
+            self.dismiss(value or None)
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
 
     class CleanupScreen(Screen[None]):
         """磁盘清理面板：列出可清理类目与占用，勾选后执行。
@@ -2815,6 +2923,11 @@ def _build_app_class(mods):
         }
         """
 
+        # textual 的系统选择依赖渲染 segment 携带 offset meta（内置文本
+        # widget 的私有协议），自定义 render 只会得到 SELECT_ALL 全选，
+        # 因此关闭系统选择，自行实现左键拖选。
+        ALLOW_SELECT = False
+
         def __init__(self, layout: "ChatLayout", msgs: List[dict], title: str, **kwargs):
             super().__init__(**kwargs)
             self._layout = layout
@@ -2822,6 +2935,10 @@ def _build_app_class(mods):
             self._title = title
             self._current_user = -1    # 视口内高亮圆点下标
             self._rebuild_worker: Optional[Worker] = None
+            # 左键拖选的锚点/焦点，(row, cell) 视口相对坐标；None 表示无选区
+            self._sel_anchor: Optional[Tuple[int, int]] = None
+            self._sel_focus: Optional[Tuple[int, int]] = None
+            self._dragging = False       # 左键按住拖动中才更新焦点
             self.virtual_size = Size(layout.width, layout.total_lines)
 
         # ---- 布局 ----
@@ -2874,6 +2991,78 @@ def _build_app_class(mods):
             elif event.state in (WorkerState.ERROR, WorkerState.CANCELLED):
                 self._rebuild_worker = None
 
+        # ---- 文本选择（自定义 render 必须自行实现；坐标为视口相对 cell） ----
+
+        def _viewport_range(self) -> Tuple[int, int]:
+            """当前视口覆盖的排版行区间 [sy, sy+height)。"""
+            sy = min(int(self.scroll_y), max(0, self._layout.total_lines - 1))
+            return sy, max(1, self.size.height)
+
+        def _viewport_plain_lines(self) -> List[str]:
+            """视口内各行的纯文本（去 markup），与屏幕行一一对应。"""
+            from rich.text import Text
+
+            lines = self._layout.lines
+            if not lines:
+                return []
+            sy, height = self._viewport_range()
+            return [Text.from_markup(line).plain for line in lines[sy: sy + height]]
+
+        def _ordered_selection(self) -> "Optional[Tuple[Tuple[int, int], Tuple[int, int]]]":
+            """锚点/焦点排序为 (start, end)；单击未拖动返回 None。"""
+            if self._sel_anchor is None or self._sel_focus is None:
+                return None
+            a, f = self._sel_anchor, self._sel_focus
+            if (f[0], f[1]) < (a[0], a[1]):
+                a, f = f, a
+            if a == f:
+                return None
+            return a, f
+
+        def _clear_selection(self) -> None:
+            self._sel_anchor = None
+            self._sel_focus = None
+            self.refresh()
+
+        def selected_text(self) -> str:
+            """当前选区覆盖的纯文本；无选区返回空串。"""
+            ordered = self._ordered_selection()
+            plain = self._viewport_plain_lines()
+            if ordered is None or not plain:
+                return ""
+            return _extract_cell_range(plain, ordered[0], ordered[1])
+
+        def on_mouse_down(self, event: MouseDown) -> None:
+            if event.button != 1:
+                return
+            self._dragging = True
+            self._sel_anchor = (max(0, int(event.y)), max(0, int(event.x)))
+            self._sel_focus = self._sel_anchor
+            self.capture_mouse()
+            self.refresh()
+
+        def on_mouse_move(self, event: MouseMove) -> None:
+            # 仅拖动中更新焦点；定型后鼠标划过不得篡改选区
+            if not self._dragging or self._sel_anchor is None:
+                return
+            focus = (
+                max(0, min(int(event.y), max(0, self.size.height - 1))),
+                max(0, int(event.x)),
+            )
+            if focus != self._sel_focus:
+                self._sel_focus = focus
+                self.refresh()
+
+        def on_mouse_up(self, event: MouseUp) -> None:
+            if not self._dragging:
+                return
+            self._dragging = False
+            self.release_mouse()
+            if self._sel_anchor is None:
+                return
+            if self._ordered_selection() is None:
+                self._clear_selection()  # 单击：清除已有选区
+
         # ---- 渲染（虚拟化：只生成视口内的行） ----
 
         def render(self) -> RenderResult:
@@ -2881,19 +3070,37 @@ def _build_app_class(mods):
             total = self._layout.total_lines
             if not lines:
                 return ""
-            sy = min(int(self.scroll_y), max(0, total - 1))
-            height = max(1, self.size.height)
+            sy, height = self._viewport_range()
             # 每行用 Rich Text 编译（支持 [b]/[i]/[dim] 等标记），
             # 只编译视口内的行，成本与消息总数无关。
+            from rich.cells import cell_len
             from rich.console import Group
             from rich.text import Text
 
-            return Group(*(Text.from_markup(line) for line in lines[sy : sy + height]))
+            ordered = self._ordered_selection()
+            sel_start = ordered[0] if ordered is not None else None
+            sel_end = ordered[1] if ordered is not None else None
+
+            rendered: List[Text] = []
+            for row, line in enumerate(lines[sy: sy + height]):
+                text = Text.from_markup(line)
+                if ordered is not None:
+                    span = _selection_row_span(row, cell_len(text.plain), sel_start, sel_end)
+                    if span is not None:
+                        i0 = _cell_to_char_index(text.plain, span[0])
+                        i1 = _cell_to_char_index(text.plain, span[1])
+                        if i1 > i0:
+                            text.stylize("reverse", i0, i1)
+                rendered.append(text)
+            return Group(*rendered)
 
         # ---- 圆点高亮（滚动事件驱动，替代原先 0.15s 轮询） ----
 
         def watch_scroll_y(self, old_value: float, new_value: float) -> None:
             super().watch_scroll_y(old_value, new_value)
+            # 选区坐标是视口相对的，滚动后会错位，直接清除避免复制出错误文本
+            if self._sel_anchor is not None and int(old_value) != int(new_value):
+                self._clear_selection()
             self._update_current_user()
 
         def _update_current_user(self) -> None:
@@ -3000,6 +3207,10 @@ def _build_app_class(mods):
             # ChatScreen 打开后，v 不应再冒泡到 CleanerApp，避免重复
             # push_screen 导致同一条记录被层层打开、返回次数增加。
             Binding("v", "ignore_view_chat", "", show=False),
+            Binding("c", "copy_selection", "复制选中"),
+            # Screen 级 ctrl+c 优先于 App 的 help_quit，仅本页生效
+            Binding("ctrl+c", "copy_selection", "", show=False),
+            Binding("e", "export_md", "导出md"),
             Binding("escape", "close", "返回"),
             Binding("q", "close", "返回"),
         ]
@@ -3048,7 +3259,7 @@ def _build_app_class(mods):
                 yield UserIndexRail(self._user_msgs, id="user-rail")
             yield Static(id="user-preview")
             yield Static(
-                f"[q/esc]返回  ↑↓/PgUp/PgDn滚动  悬停圆点查看/滚轮滚动圆点链 — {self._title}",
+                f"[[q/esc]返回  [[c]复制选中  [[e]导出md  ↑↓/PgUp/PgDn滚动  悬停圆点查看/滚轮滚动圆点链 — {_md_escape(self._title)}",
                 id="chat-footer",
             )
 
@@ -3126,6 +3337,37 @@ def _build_app_class(mods):
         def action_close(self) -> None:
             self.app.pop_screen()
 
+        def action_copy_selection(self) -> None:
+            """复制鼠标左键拖选高亮的文本到系统剪贴板（Win32 API）。"""
+            text = self._chat_log.selected_text()
+            if not text:
+                self.notify("先按住鼠标左键拖选要复制的文本，再按 c", timeout=3)
+                return
+            if _copy_to_clipboard(text):
+                self.notify(f"已复制 {len(text)} 个字符", timeout=3)
+            else:
+                self.notify("复制失败：剪贴板不可用", severity="error", timeout=3)
+
+        def action_export_md(self) -> None:
+            """弹出路径输入框，把当前会话导出为 Markdown 文件。"""
+            default = os.path.join(
+                "exports",
+                f"{_sanitize_filename(self._title)}-{time.strftime('%Y%m%d-%H%M%S')}.md",
+            )
+
+            def _do_export(path: Optional[str]) -> None:
+                if not path:
+                    self.notify("已取消导出", timeout=2)
+                    return
+                try:
+                    out = export_conversation_md("", self._title, self._msgs, path)
+                except OSError as e:
+                    self.notify(f"导出失败: {e}", severity="error", timeout=5)
+                    return
+                self.notify(f"已导出: {out}", timeout=8)
+
+            self.app.push_screen(ExportModal(default), _do_export)
+
         def action_ignore_view_chat(self) -> None:
             """聊天记录已打开时忽略重复的 v 操作。"""
             return
@@ -3157,6 +3399,9 @@ def _build_app_class(mods):
         #confirm-text { text-align: center; margin-bottom: 1; }
         #confirm-btns { align: center middle; }
         #confirm-btns Button { margin: 0 1; }
+        #export-box { width: 76; height: auto; padding: 1 2; border: thick $accent;
+                     background: $surface; content-align: center middle; }
+        #export-text { margin-bottom: 1; }
         #chat-footer { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
         """
 
