@@ -2597,7 +2597,7 @@ def _tui_imports():
         from textual.app import App, ComposeResult, RenderResult
         from textual.binding import Binding
         from textual.containers import Horizontal, Vertical, VerticalScroll
-        from textual.events import Click, Leave, MouseMove
+        from textual.events import Click, Leave, MouseDown, MouseMove, MouseUp
         from textual.geometry import Offset, Size
         from textual.message import Message
         from textual.screen import ModalScreen, Screen
@@ -2605,7 +2605,7 @@ def _tui_imports():
         from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, Static
         from textual.worker import Worker, WorkerState
         return (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
-                Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
+                Click, Leave, MouseDown, MouseMove, MouseUp, Offset, Size, Message, ModalScreen, Screen, ScrollView,
                 Button, Checkbox, DataTable, Footer, Header, Input, Label, Static,
                 on, Worker, WorkerState)
     except ImportError:
@@ -2628,7 +2628,7 @@ TUI_APP_CLASS = None  # 测试可引用
 
 def _build_app_class(mods):
     (App, ComposeResult, RenderResult, Binding, Horizontal, Vertical, VerticalScroll,
-     Click, Leave, MouseMove, Offset, Size, Message, ModalScreen, Screen, ScrollView,
+     Click, Leave, MouseDown, MouseMove, MouseUp, Offset, Size, Message, ModalScreen, Screen, ScrollView,
      Button, Checkbox, DataTable, Footer, Header, Input, Label, Static,
      on, Worker, WorkerState) = mods
 
@@ -2923,6 +2923,11 @@ def _build_app_class(mods):
         }
         """
 
+        # textual 的系统选择依赖渲染 segment 携带 offset meta（内置文本
+        # widget 的私有协议），自定义 render 只会得到 SELECT_ALL 全选，
+        # 因此关闭系统选择，自行实现左键拖选。
+        ALLOW_SELECT = False
+
         def __init__(self, layout: "ChatLayout", msgs: List[dict], title: str, **kwargs):
             super().__init__(**kwargs)
             self._layout = layout
@@ -2930,7 +2935,10 @@ def _build_app_class(mods):
             self._title = title
             self._current_user = -1    # 视口内高亮圆点下标
             self._rebuild_worker: Optional[Worker] = None
-            self._selection = None     # textual 选择系统同步过来的选区
+            # 左键拖选的锚点/焦点，(row, cell) 视口相对坐标；None 表示无选区
+            self._sel_anchor: Optional[Tuple[int, int]] = None
+            self._sel_focus: Optional[Tuple[int, int]] = None
+            self._dragging = False       # 左键按住拖动中才更新焦点
             self.virtual_size = Size(layout.width, layout.total_lines)
 
         # ---- 布局 ----
@@ -2983,7 +2991,7 @@ def _build_app_class(mods):
             elif event.state in (WorkerState.ERROR, WorkerState.CANCELLED):
                 self._rebuild_worker = None
 
-        # ---- 文本选择（自定义 render 必须自行实现选择协议） ----
+        # ---- 文本选择（自定义 render 必须自行实现；坐标为视口相对 cell） ----
 
         def _viewport_range(self) -> Tuple[int, int]:
             """当前视口覆盖的排版行区间 [sy, sy+height)。"""
@@ -3000,22 +3008,60 @@ def _build_app_class(mods):
             sy, height = self._viewport_range()
             return [Text.from_markup(line).plain for line in lines[sy: sy + height]]
 
-        def get_selection(self, selection) -> "Optional[Tuple[str, str]]":
-            """textual 选择系统回调：把选区 cell 坐标映射到视口纯文本。
-
-            选区坐标是视口相对的 (行, cell列)；中文按 2 格换算字符索引。
-            """
-            plain = self._viewport_plain_lines()
-            if not plain:
+        def _ordered_selection(self) -> "Optional[Tuple[Tuple[int, int], Tuple[int, int]]]":
+            """锚点/焦点排序为 (start, end)；单击未拖动返回 None。"""
+            if self._sel_anchor is None or self._sel_focus is None:
                 return None
-            start = selection.start.transpose if selection.start is not None else None
-            end = selection.end.transpose if selection.end is not None else None
-            text = _extract_cell_range(plain, start, end)
-            return (text, "\n") if text else None
+            a, f = self._sel_anchor, self._sel_focus
+            if (f[0], f[1]) < (a[0], a[1]):
+                a, f = f, a
+            if a == f:
+                return None
+            return a, f
 
-        def selection_updated(self, selection) -> None:
-            self._selection = selection
+        def _clear_selection(self) -> None:
+            self._sel_anchor = None
+            self._sel_focus = None
             self.refresh()
+
+        def selected_text(self) -> str:
+            """当前选区覆盖的纯文本；无选区返回空串。"""
+            ordered = self._ordered_selection()
+            plain = self._viewport_plain_lines()
+            if ordered is None or not plain:
+                return ""
+            return _extract_cell_range(plain, ordered[0], ordered[1])
+
+        def on_mouse_down(self, event: MouseDown) -> None:
+            if event.button != 1:
+                return
+            self._dragging = True
+            self._sel_anchor = (max(0, int(event.y)), max(0, int(event.x)))
+            self._sel_focus = self._sel_anchor
+            self.capture_mouse()
+            self.refresh()
+
+        def on_mouse_move(self, event: MouseMove) -> None:
+            # 仅拖动中更新焦点；定型后鼠标划过不得篡改选区
+            if not self._dragging or self._sel_anchor is None:
+                return
+            focus = (
+                max(0, min(int(event.y), max(0, self.size.height - 1))),
+                max(0, int(event.x)),
+            )
+            if focus != self._sel_focus:
+                self._sel_focus = focus
+                self.refresh()
+
+        def on_mouse_up(self, event: MouseUp) -> None:
+            if not self._dragging:
+                return
+            self._dragging = False
+            self.release_mouse()
+            if self._sel_anchor is None:
+                return
+            if self._ordered_selection() is None:
+                self._clear_selection()  # 单击：清除已有选区
 
         # ---- 渲染（虚拟化：只生成视口内的行） ----
 
@@ -3031,14 +3077,14 @@ def _build_app_class(mods):
             from rich.console import Group
             from rich.text import Text
 
-            sel = self._selection
-            sel_start = sel.start.transpose if sel is not None and sel.start is not None else None
-            sel_end = sel.end.transpose if sel is not None and sel.end is not None else None
+            ordered = self._ordered_selection()
+            sel_start = ordered[0] if ordered is not None else None
+            sel_end = ordered[1] if ordered is not None else None
 
             rendered: List[Text] = []
             for row, line in enumerate(lines[sy: sy + height]):
                 text = Text.from_markup(line)
-                if sel is not None:
+                if ordered is not None:
                     span = _selection_row_span(row, cell_len(text.plain), sel_start, sel_end)
                     if span is not None:
                         i0 = _cell_to_char_index(text.plain, span[0])
@@ -3052,6 +3098,9 @@ def _build_app_class(mods):
 
         def watch_scroll_y(self, old_value: float, new_value: float) -> None:
             super().watch_scroll_y(old_value, new_value)
+            # 选区坐标是视口相对的，滚动后会错位，直接清除避免复制出错误文本
+            if self._sel_anchor is not None and int(old_value) != int(new_value):
+                self._clear_selection()
             self._update_current_user()
 
         def _update_current_user(self) -> None:
@@ -3289,10 +3338,10 @@ def _build_app_class(mods):
             self.app.pop_screen()
 
         def action_copy_selection(self) -> None:
-            """复制鼠标拖选高亮的文本到系统剪贴板（Win32 API，不依赖终端 OSC52）。"""
-            text = self.get_selected_text()
+            """复制鼠标左键拖选高亮的文本到系统剪贴板（Win32 API）。"""
+            text = self._chat_log.selected_text()
             if not text:
-                self.notify("先用鼠标拖选要复制的文本，再按 c", timeout=3)
+                self.notify("先按住鼠标左键拖选要复制的文本，再按 c", timeout=3)
                 return
             if _copy_to_clipboard(text):
                 self.notify(f"已复制 {len(text)} 个字符", timeout=3)
