@@ -10,7 +10,7 @@
 
 - 扫描并分类 Cursor 会话
 - 查看聊天记录
-- 聊天记录页面支持鼠标拖选复制文本、导出 Markdown 文档
+- 聊天记录页面支持鼠标拖选复制文本、导出 Markdown 文档（按用户消息分组的美化排版）
 - 识别归档会话、镜像残留和正文孤儿数据
 - 删除已归档会话、镜像残留和正文孤儿数据
 - 会话级备份：把勾选会话导出为 JSON 存档（不复制整个数据库），可从存档恢复会话
@@ -109,7 +109,7 @@ start_cursor_cleaner.bat
 | --- | --- |
 | 按住鼠标左键拖选 | 选中对话文本（高亮显示） |
 | `C` / `Ctrl+C` | 复制选中的文本到剪贴板 |
-| `E` | 导出当前会话为 Markdown 文件（可自定义保存路径） |
+| `E` | 导出当前会话为 Markdown 文件（可自定义保存路径；每条用户消息对应一个二级标题分组，助手消息归入其下） |
 | 点击右侧圆点 | 跳转到对应用户消息位置 |
 
 ### 自动化/测试接口
@@ -182,12 +182,13 @@ python cursor_cleaner.py --db "D:\\test\\state.vscdb" --op preview
 
 ```text
 cursor-cleaner/
-├── cursor_cleaner.py          # 主程序
-├── start_cursor_cleaner.bat   # Windows 启动脚本
-├── requirements.txt           # Python 依赖
-├── README.md                  # 项目说明
-├── LICENSE                    # 开源许可证
-└── .gitignore                 # Git 忽略规则
+├── cursor_cleaner.py                  # 主程序
+├── conversation_markdown_formatter.py # 导出 Markdown 美化模块（纯函数，无 IO）
+├── start_cursor_cleaner.bat           # Windows 启动脚本
+├── requirements.txt                   # Python 依赖
+├── README.md                          # 项目说明
+├── LICENSE                            # 开源许可证
+└── .gitignore                         # Git 忽略规则
 ```
 
 ## 开源协议
