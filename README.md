@@ -1,6 +1,6 @@
 # Cursor Cleaner
 
-一个面向 Windows 的 Cursor 会话维护工具，提供 TUI（终端界面）和 CLI（命令行）两种使用方式。
+一个面向 Windows 的 Cursor 会话维护工具，日常使用通过 TUI（终端界面）操作。
 
 它会读取 Cursor 的本地会话数据库，帮助你查看、备份和清理无用会话数据。聊天记录和数据库内容只在本机处理，不会上传到网络。
 
@@ -10,6 +10,7 @@
 
 - 扫描并分类 Cursor 会话
 - 查看聊天记录
+- 聊天记录页面支持鼠标拖选复制文本、导出 Markdown 文档
 - 识别归档会话、镜像残留和正文孤儿数据
 - 删除已归档会话、镜像残留和正文孤儿数据
 - 会话级备份：把勾选会话导出为 JSON 存档（不复制整个数据库），可从存档恢复会话
@@ -102,7 +103,18 @@ start_cursor_cleaner.bat
 | `Q` | 退出工具 |
 | `Q` / `Esc` | 在聊天记录页面返回 |
 
-### CLI
+聊天记录页面（按 `V` 进入）中：
+
+| 操作 | 功能 |
+| --- | --- |
+| 按住鼠标左键拖选 | 选中对话文本（高亮显示） |
+| `C` / `Ctrl+C` | 复制选中的文本到剪贴板 |
+| `E` | 导出当前会话为 Markdown 文件（可自定义保存路径） |
+| 点击右侧圆点 | 跳转到对应用户消息位置 |
+
+### 自动化/测试接口
+
+`--op` 系列命令仅供测试与自动化脚本使用，日常维护请直接使用上面的 TUI。
 
 预览会话分类：
 
@@ -128,14 +140,10 @@ python cursor_cleaner.py --op backup-sessions --ids <id1>,<id2>
 python cursor_cleaner.py --op restore-sessions --file <备份.json>
 ```
 
-其他可用操作：
+修复 composerHeaders 镜像：
 
-```text
-backup-sessions  备份指定会话为 JSON 存档（--ids 逗号分隔）
-restore-sessions 从 JSON 存档恢复会话（--file 指定，否则列表选择）
-wipe-all         清空全部会话（危险）
-purge-index      清理 conversation-search.db
-repair-mirror    修复 composerHeaders 镜像
+```bash
+python cursor_cleaner.py --op repair-mirror
 ```
 
 跳过 Cursor 运行检测：
