@@ -951,7 +951,10 @@ def _message_tools(payload: Any) -> List[dict]:
     return result
 
 
-def fetch_conversation(cid: str, paths: Optional[Iterable[str]] = None) -> List[dict]:
+def fetch_conversation(
+    cid: str,
+    paths: Optional[Iterable[str]] = None,
+) -> List[dict]:
     """
     还原一个会话的聊天记录（按时间顺序）。
     数据源: composerData 的消息索引 + 各 bubbleId 键；globalStorage 和
@@ -979,71 +982,136 @@ def fetch_conversation(cid: str, paths: Optional[Iterable[str]] = None) -> List[
         except sqlite3.Error:
             continue
         try:
-            key_index = _bubble_key_index(con)
             payloads: List[Any] = []
             try:
-                rows = con.execute(
-                    "SELECT key, value FROM cursorDiskKV WHERE key = ? OR key LIKE ?",
-                    (f"composerData:{cid}", f"composerData:{cid}:%"),
-                ).fetchall()
+                # 先做精确主键查询。OR + LIKE 会让部分 SQLite 计划退化成
+                # 全表扫描；composerData 分片键极少见，只在精确键缺失时查。
+                row = con.execute(
+                    "SELECT value FROM cursorDiskKV WHERE key=?",
+                    (f"composerData:{cid}",),
+                ).fetchone()
+                rows = [(f"composerData:{cid}", row[0])] if row else []
+                if not rows:
+                    prefix = f"composerData:{cid}:"
+                    rows = con.execute(
+                        "SELECT key, value FROM cursorDiskKV "
+                        "WHERE key>=? AND key<?",
+                        (prefix, prefix + "\uffff"),
+                    ).fetchall()
                 for key, value in rows:
                     payloads.append(_decode_json(value))
             except sqlite3.DatabaseError:
                 pass
             if not payloads:
                 payloads = _item_conversation_payloads(con, cid)
-            loaded.append((path, key_index, payloads))
+            loaded.append((path, payloads))
         finally:
             con.close()
 
     # 不同 Cursor 版本可能把 composerData 和 bubble 正文分散到不同
     # state.vscdb；跨库合并 bid 索引，先出现的库优先（与原全表行顺序
     # 语义一致）。
-    all_keys: Dict[str, str] = {}
-    for _, key_index, _ in loaded:
-        for bid, key in key_index.items():
-            all_keys.setdefault(bid, key)
-
     # 解析消息头，收集实际需要的 bubble 键集合。
-    wanted_keys: Set[str] = set()
-    for _, _, payloads in loaded:
+    wanted_bids: Set[str] = set()
+    for _, payloads in loaded:
         for cdata in payloads:
             headers = _conversation_headers(cdata)
             for header in headers:
                 bid = _bubble_id(header)
-                key = all_keys.get(bid) if bid else None
-                if key:
-                    wanted_keys.add(key)
+                if bid:
+                    wanted_bids.add(bid)
 
-    # 阶段二：按库用 WHERE key IN (...) 分批精确取值，替代原先对
-    # 全表行集合的线性扫描（O(消息数 × 总键数) -> O(总键数 + 消息数)）。
+    def _candidate_forms(bid: str) -> List[Tuple[int, str]]:
+        forms = [
+            (0, f"bubbleId:{bid}"),
+            (1, f"bubble:{bid}"),
+        ]
+        if cid:
+            forms.extend((
+                (2, f"bubbleId:{cid}:{bid}"),
+                (3, f"bubble:{cid}:{bid}"),
+            ))
+        return forms
+
+    # 常见键都是可枚举的完整主键。一次精确 IN 查询能利用索引，避免为了
+    # 构建 bid 索引而读取全部 bubbleId 键名。
+    chosen_keys: Dict[str, str] = {}
+    key_ranks: Dict[str, int] = {}
     bubble_values: Dict[str, Any] = {}
-    for path, key_index, _ in loaded:
-        if not wanted_keys:
+    for path, _ in loaded:
+        missing = wanted_bids - chosen_keys.keys()
+        if not missing:
             break
-        db_keys = sorted(key for key in key_index.values() if key in wanted_keys)
-        if not db_keys:
-            continue
+        candidates: Dict[str, Tuple[int, str]] = {}
+        for bid in missing:
+            for rank, key in _candidate_forms(bid):
+                candidates.setdefault(key, (rank, bid))
         try:
             con = open_db_ro(path)
         except sqlite3.Error:
             continue
         try:
-            for i in range(0, len(db_keys), 500):
-                batch = db_keys[i:i + 500]
+            keys = sorted(candidates)
+            for i in range(0, len(keys), 500):
+                batch = keys[i:i + 500]
                 placeholders = ",".join("?" * len(batch))
                 rows = con.execute(
                     f"SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})",
                     batch,
                 ).fetchall()
                 for key, value in rows:
-                    bubble_values.setdefault(str(key), value)
+                    rank, bid = candidates[str(key)]
+                    current_rank = key_ranks.get(bid, 99)
+                    if bid not in chosen_keys or rank < current_rank:
+                        chosen_keys[bid] = str(key)
+                        key_ranks[bid] = rank
+                        bubble_values[str(key)] = value
         except sqlite3.DatabaseError:
             pass
         finally:
             con.close()
 
-    for _, _, payloads in loaded:
+    # 少数版本会带版本号或分片后缀。只有常见完整键缺失时，才回退到
+    # 全量 bubble 键名索引。
+    for path, _ in loaded:
+        missing = wanted_bids - chosen_keys.keys()
+        if not missing:
+            break
+        try:
+            con = open_db_ro(path)
+        except sqlite3.Error:
+            continue
+        try:
+            key_index = _bubble_key_index(con)
+            db_keys = {bid: key_index[bid] for bid in missing if bid in key_index}
+            if not db_keys:
+                continue
+            keys = sorted(db_keys.values())
+            for i in range(0, len(keys), 500):
+                batch = keys[i:i + 500]
+                placeholders = ",".join("?" * len(batch))
+                rows = con.execute(
+                    f"SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for key, value in rows:
+                    key = str(key)
+                    if key not in bubble_values:
+                        bubble_values[key] = value
+            for bid, key in db_keys.items():
+                if key in bubble_values:
+                    chosen_keys[bid] = key
+        except sqlite3.DatabaseError:
+            pass
+        finally:
+            con.close()
+
+    # 阶段二：按库用 WHERE key IN (...) 分批精确取值，替代原先对
+    # 全表行集合的线性扫描（O(消息数 × 总键数) -> O(总键数 + 消息数)）。
+    all_keys = {
+        bid: key for bid, key in chosen_keys.items()
+    }
+    for _, payloads in loaded:
         for cdata in payloads:
             headers = _conversation_headers(cdata)
             for index, header in enumerate(headers):
