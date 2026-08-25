@@ -16,6 +16,8 @@ build/
 dist/
 *.egg-info/
 *.whl
+exports/
+*.spec
 
 # Cursor / SQLite data and backups
 *.db
