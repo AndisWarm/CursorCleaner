@@ -2154,9 +2154,10 @@ def restore_sessions(backup_path: str) -> dict:
     }
 
 
-def delete_sessions(sessions: List[Session]) -> dict:
+def delete_sessions(sessions: List[Session], vacuum: bool = True) -> dict:
     """
-    删除指定会话：表行 + 镜像条目 + 正文键，单事务提交，之后 VACUUM。
+    删除指定会话：表行 + 镜像条目 + 正文键，单事务提交。
+    vacuum=True 时随后压缩数据库；大库上这一步可能耗时数分钟。
     返回统计信息。本函数不自动备份；需要留档时请先调用
     backup_sessions() 备份勾选会话。
     """
@@ -2190,8 +2191,9 @@ def delete_sessions(sessions: List[Session]) -> dict:
             con.commit()
 
             # workspaceStorage 中有些 state.vscdb 没有会话表，避免无意义
-            # VACUUM；失败也不影响已提交的删除。
-            if db_table_del or before != after or db_keys_del:
+            # VACUUM；失败也不影响已提交的删除。TUI 默认把 VACUUM 留给
+            # 磁盘清理面板，让会话删除立即完成并释放逻辑空间。
+            if vacuum and (db_table_del or before != after or db_keys_del):
                 try:
                     print(f"正在压缩数据库（VACUUM）：{db_path}…")
                     cur.execute("VACUUM")
@@ -3499,6 +3501,7 @@ def _build_app_class(mods):
             self._chat_worker: Optional[Worker] = None
             self._chat_title: Optional[str] = None
             self._backup_worker: Optional[Worker] = None
+            self._delete_worker: Optional[Worker] = None
 
         def compose(self) -> ComposeResult:
             yield NoToggleHeader(show_clock=True)
@@ -3544,6 +3547,10 @@ def _build_app_class(mods):
             ))
 
         def refresh_data_quiet(self) -> None:
+            # 删除/VACUUM 过程中数据库会持续变化；此时扫描不仅没有意义，
+            # 还可能在主线程撞上写入锁。
+            if self._delete_worker is not None:
+                return
             # 数据库文件没有变化时直接跳过，避免每 5 秒全量 scan()。
             try:
                 fp = _db_fingerprint()
@@ -3809,6 +3816,10 @@ def _build_app_class(mods):
         @on(Worker.StateChanged)
         def on_worker_state_changed(self, event: "Worker.StateChanged") -> None:
             """聊天详情/备份 worker 结束时在主线程处理结果。"""
+            if event.worker is self._delete_worker:
+                if event.state in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
+                    self._finish_delete_worker(event.worker)
+                return
             if event.worker is self._backup_worker:
                 if event.state == WorkerState.SUCCESS:
                     worker = self._backup_worker
@@ -3846,6 +3857,9 @@ def _build_app_class(mods):
                 self._chat_title = None
 
         def action_delete_selected(self) -> None:
+            if self._delete_worker is not None:
+                self.notify("删除正在进行中…", timeout=3)
+                return
             if not self.selected:
                 self.notify("没有勾选任何会话", timeout=3)
                 return
@@ -3902,19 +3916,40 @@ def _build_app_class(mods):
                 if cursor_running():
                     self.notify("Cursor 正在运行！请先完全退出再删除。", severity="error", timeout=5)
                     return
-                try:
-                    stats = delete_sessions(targets)
-                except Exception as e:
-                    self.notify(f"删除失败: {e}", severity="error", timeout=5)
-                    return
-                self.selected.clear()
-                self.refresh_data()
-                self.notify(
-                    f"完成: 会话 {stats['sessions']}，镜像 {stats['mirror'][0]}→{stats['mirror'][1]}，正文键 {stats['keys']}",
-                    timeout=6,
+
+                def _delete() -> dict:
+                    return delete_sessions(targets, vacuum=False)
+
+                self._delete_worker = self.run_worker(
+                    _delete, thread=True, exit_on_error=False
+                )
+                self.update_status()
+                self.query_one("#status-bar", Static).update(
+                    f"[删除] 目标 {len(targets)} 个 | 正在删除…"
+                )
+                self.query_one("#foot-hint", Static).update(
+                    "数据已进入后台删除；磁盘空间可稍后按 X 打开磁盘清理，执行压缩数据库。"
                 )
 
             self.push_screen(ConfirmModal(msg), _ask)
+
+        def _finish_delete_worker(self, worker: "Worker") -> None:
+            self._delete_worker = None
+            stats = worker.result if isinstance(worker.result, dict) else {}
+            try:
+                self.refresh_data(force=True)
+            except Exception as e:
+                self.notify(f"刷新会话列表失败: {e}", severity="error", timeout=5)
+            if worker.state == WorkerState.SUCCESS:
+                self.selected.clear()
+                self.notify(
+                    f"完成: 会话 {stats.get('sessions', 0)}，"
+                    f"镜像 {stats.get('mirror', (0, 0))[0]}→{stats.get('mirror', (0, 0))[1]}，"
+                    f"正文键 {stats.get('keys', 0)}",
+                    timeout=8,
+                )
+            else:
+                self.notify(f"删除失败: {worker.error}", severity="error", timeout=8)
 
     return CleanerApp
 
