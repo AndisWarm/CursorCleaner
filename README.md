@@ -9,13 +9,15 @@
 ## 功能
 
 - 扫描并分类 Cursor 会话
+- 按会话 ID 查找定位：TUI 中按 `F` 输入完整 UUID 或前缀即可跳转到对应会话；命令行可用 `--op find --id` 查看会话详情
 - 查看聊天记录
 - 聊天记录页面支持鼠标拖选复制文本、导出 Markdown 文档（按用户消息分组的美化排版）
 - 识别归档会话、镜像残留和正文孤儿数据
-- 删除已归档会话、镜像残留和正文孤儿数据
+- 删除已归档会话、镜像残留和正文孤儿数据；删除前自动校验关联的聊天转录目录并展示，确认后把转录文件移入 `transcript-trash` 回收站（可恢复），不再遗留在 `agent-transcripts` 中
+- 清理已删会话遗留的孤儿转录目录
 - 会话级备份：把勾选会话导出为 JSON 存档（不复制整个数据库），可从存档恢复会话
 - 清理会话搜索索引 `conversation-search.db`
-- 磁盘清理面板：一键清理工具备份文件、搜索索引、压缩会话数据库、删除 Cursor 缓存/日志目录
+- 磁盘清理面板：一键清理工具备份文件、搜索索引、压缩会话数据库、删除 Cursor 缓存/日志目录、清空转录回收站
 - 复制会话 ID 到剪贴板
 - 支持通过 `--db` 指定测试数据库
 - 自动隐藏同一账号会话产生的空草稿/占位副本，优先保留有正文的记录
@@ -96,9 +98,10 @@ start_cursor_cleaner.bat
 | `N` | 取消全选 |
 | `V` | 查看当前会话聊天记录 |
 | `C` | 复制当前会话完整 ID 到剪贴板 |
-| `D` | 删除勾选的会话，并连带清理同组隐藏副本与隐藏残留（不自动备份，建议先按 `B` 备份） |
+| `F` | 输入会话 ID（完整 UUID 或至少 4 位前缀）定位到列表中的对应会话；目标行被筛选隐藏时自动切回"全部" |
+| `D` | 删除勾选的会话，并连带清理同组隐藏副本与隐藏残留；关联的聊天转录移入 `transcript-trash` 回收站（不自动备份，建议先按 `B` 备份） |
 | `B` | 备份勾选的会话为 JSON 存档 |
-| `X` | 打开磁盘清理面板（备份/索引/VACUUM/缓存） |
+| `X` | 打开磁盘清理面板（备份/索引/VACUUM/缓存/转录回收站） |
 | `R` | 立即刷新会话列表 |
 | `Q` | 退出工具 |
 | `Q` / `Esc` | 在聊天记录页面返回 |
@@ -122,10 +125,31 @@ start_cursor_cleaner.bat
 python cursor_cleaner.py --op preview
 ```
 
+按会话 ID 查找并显示详情（支持完整 UUID 或至少 4 位前缀，前缀命中多个时会列出候选）：
+
+```bash
+python cursor_cleaner.py --op find --id 92a1bbef-4673-45b2-ad97-d4e7d412749b
+```
+
+输出包含状态、标题、创建/更新时间、消息数、正文键数与来源数据库路径，便于确认后再备份或删除。若该 ID 对应的会话正文已不存在（例如此前已被删除），会列出仍引用该 ID 的 UI 状态残留键，帮助确认会话去向。
+
 删除已归档会话、镜像残留和正文孤儿数据：
 
 ```bash
 python cursor_cleaner.py --op delete-archived --yes
+```
+
+删除前会校验各会话关联的聊天转录目录并展示；加 `--sync-transcripts` 可在删除后把这些转录目录移入 `transcript-trash` 回收站（可恢复），加 `--include-assistant` 连带处理第三方副本 `.cursor-local-assistant-v2\history`（属主为另一个本地代理工具，默认不动）：
+
+```bash
+python cursor_cleaner.py --op delete-archived --yes --sync-transcripts
+```
+
+清理已删会话遗留的孤儿转录目录（`--dry-run` 仅展示将处理的目录与大小；执行时移入 `transcript-trash` 回收站）：
+
+```bash
+python cursor_cleaner.py --op clean-transcripts --dry-run
+python cursor_cleaner.py --op clean-transcripts --yes
 ```
 
 备份指定会话为 JSON 存档：
@@ -176,6 +200,12 @@ python cursor_cleaner.py --db "D:\\test\\state.vscdb" --op preview
 
 ```text
 %APPDATA%\Cursor\User\globalStorage\conversation-search.db
+```
+
+删除会话时级联移出的转录回收站位于：
+
+```text
+%APPDATA%\Cursor\User\transcript-trash\<时间戳>\
 ```
 
 ## 项目结构

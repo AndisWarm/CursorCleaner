@@ -1246,16 +1246,20 @@ def _tokens_to_text(tokens) -> str:
     """把行内 markdown token 树转回纯文本，仅保留粗体/斜体/行内代码标记。
 
     返回的是带轻量样式的文本；[b]/[i]/[r] 标记由 Rich 的 markup 语法
-    解释（与 TUI 状态栏等处的写法一致）。
+    解释（与 TUI 状态栏等处的写法一致）。原文内容统一经 _md_escape
+    转义，保证只有这里刻意输出的样式标记会被 Rich 解析。
     """
     parts: List[str] = []
     for tok in tokens:
         if tok.type == "text":
-            parts.append(tok.content)
+            # 消息原文可能含 [ ]（日志、代码、markdown 任务列表等），
+            # 必须转义，否则 ChatLog 渲染时会被当作 Rich 样式标记，
+            # 出现 [/x] 之类不匹配闭合标签直接 MarkupError 闪退。
+            parts.append(_md_escape(tok.content))
         elif tok.type == "softbreak" or tok.type == "hardbreak":
             parts.append("\n")
         elif tok.type == "code_inline":
-            parts.append(f"[r]{tok.content}[/]")
+            parts.append(f"[r]{_md_escape(tok.content)}[/]")
         elif tok.type == "strong_open":
             parts.append("[b]")
         elif tok.type == "strong_close":
@@ -1274,19 +1278,30 @@ def _tokens_to_text(tokens) -> str:
         elif tok.type == "link_close":
             pass
         elif tok.type == "image":
-            parts.append(tok.content or "（图片）")
+            parts.append(_md_escape(tok.content or "（图片）"))
         elif tok.type == "html_inline":
-            parts.append(tok.content)
+            parts.append(_md_escape(tok.content))
         else:
             content = getattr(tok, "content", "") or ""
             if content:
-                parts.append(content)
+                parts.append(_md_escape(content))
     return "".join(parts)
 
 
 def _md_escape(text: str) -> str:
-    """把普通文本转成 Rich markup 安全形式（避免 [ 被当作样式解析）。"""
-    return text.replace("[", "[[")  # Rich 中 [[ 表示字面 [
+    """把普通文本转成 Rich markup 安全形式（避免 [ 被当作样式解析）。
+
+    Rich 的转义符是反斜杠：`\\[x]` 渲染为字面 [x]。`[[` 并不是转义——
+    第二个 [ 仍会与后续字符组成标签（[[/x] 会解析出不匹配的闭合标签
+    [/x]，ChatLog 渲染时直接 MarkupError 闪退）。因此按
+    rich.markup.escape 的语义：仅给标签样式的 [seq] 前插反斜杠并保留
+    原文已有的反斜杠配对，非标签形式（如 [DONE]、list[0]）原样保留。
+    """
+    if "[" not in text:
+        return text
+    from rich.markup import escape as _rich_escape
+
+    return _rich_escape(text)
 
 
 @dataclass
@@ -2262,6 +2277,181 @@ def fmt_message_ts(value: Any) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
 
 
+# CLI 输出用的状态中文标签；TUI 的 STATUS_LABEL 定义在 _build_app_class 内。
+STATUS_LABEL_CLI = {
+    S_ARCHIVED: "已归档",
+    S_ACTIVE: "未归档",
+    S_MIRROR_ONLY: "镜像残留",
+    S_CONTENT_ONLY: "正文孤儿",
+}
+
+
+def find_sessions_by_id(query: str, sessions: Optional[List[Session]] = None) -> List[Session]:
+    """按会话 ID 查找：精确匹配优先，其次前缀匹配。
+
+    规范化输入：去首尾空白与成对引号，比较时大小写不敏感。
+    前缀匹配要求至少 4 个字符，避免过短输入命中过多噪音。
+    sessions 为 None 时扫描全部数据库（含隐藏占位副本）。
+    返回按最后更新时间倒序的匹配列表，找不到返回空列表。
+    """
+    norm = (query or "").strip().strip("'\"").strip().lower()
+    if not norm:
+        return []
+    if sessions is None:
+        sessions = scan(include_hidden=True)
+    exact = [s for s in sessions if s.composer_id.lower() == norm]
+    if exact:
+        return sorted(exact, key=lambda s: (s.last_updated or 0), reverse=True)
+    if len(norm) < 4:
+        return []
+    prefix = [s for s in sessions if s.composer_id.lower().startswith(norm)]
+    return sorted(prefix, key=lambda s: (s.last_updated or 0), reverse=True)
+
+
+def find_session_traces(cid: str, db_paths: Optional[Iterable[str]] = None) -> List[Tuple[str, str]]:
+    """在会话正文数据之外查找某 ID 的残留痕迹（只读）。
+
+    用户手里的 ID 也可能来自已被删除的会话：正文键删掉后，ItemTable 里
+    仍会留下按会话 ID 命名的 UI 状态键（如 Cursor Agent 面板的
+    glass/cursor.editorPanelVisibility.agent/<id>）。这些引用不构成
+    会话，但能解释“为什么找不到”。只在未命中会话时调用。
+    返回 (库标签, 键名) 列表；每个库最多取 8 条避免刷屏。
+    """
+    norm = (cid or "").strip().strip("'\"").strip().lower()
+    if not norm:
+        return []
+    paths = _unique_paths(db_paths if db_paths is not None else database_paths())
+    traces: List[Tuple[str, str]] = []
+    for path in paths:
+        label = os.path.basename(os.path.dirname(path)) or path
+        try:
+            con = open_db_ro(path)
+        except sqlite3.Error:
+            continue
+        try:
+            rows = con.execute(
+                "SELECT key FROM ItemTable WHERE key LIKE ? LIMIT 8",
+                (f"%{norm}%",),
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            con.close()
+        traces.extend((label, key) for (key,) in rows)
+    return traces
+
+
+# =====================================================================
+# 会话关联文件（转录 / 第三方副本）映射与级联删除
+# =====================================================================
+
+# Cursor 的 Agent 聊天转录目录：~\.cursor\projects\<项目别名>\agent-transcripts\
+# <composerId>\<composerId>.jsonl。目录名与会话 composerId 一一对应（实测）。
+CURSOR_PROJECTS_ROOT = os.path.join(os.path.expanduser("~"), ".cursor", "projects")
+# 第三方本地代理工具的会话副本目录（属主是 .cursor-local-assistant-v2 应用）。
+ASSISTANT_HISTORY_ROOT = os.path.join(os.path.expanduser("~"), ".cursor-local-assistant-v2", "history")
+# 级联删除的回收站：移入而非直接删除，可在磁盘清理面板中确认后清空。
+TRANSCRIPT_TRASH_DIR = os.path.join(os.path.dirname(GLOBAL_STORAGE), "transcript-trash")
+
+
+def _dir_bytes(path: str) -> int:
+    try:
+        return _dir_size(path) if os.path.isdir(path) else os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def find_artifact_links(cids: Set[str]) -> dict:
+    """按 composerId 校验会话在外部的关联文件（只读，仅 listdir，瞬时）。
+
+    映射依据：转录目录名 == composerId（Cursor 当前版本的存储约定）。
+    返回 {"transcripts": {cid: [(slug, path, bytes), ...]},
+          "assistant":  {cid: [(path, bytes), ...]}}
+    """
+    wanted = {c.lower() for c in cids if c}
+    links: dict = {"transcripts": {}, "assistant": {}}
+    if not wanted:
+        return links
+    for slug_dir in sorted(glob.glob(os.path.join(CURSOR_PROJECTS_ROOT, "*"))):
+        if not os.path.isdir(slug_dir):
+            continue
+        slug = os.path.basename(slug_dir)
+        for conv_dir in sorted(glob.glob(os.path.join(slug_dir, "agent-transcripts", "*"))):
+            cid = os.path.basename(conv_dir).lower()
+            if cid in wanted and os.path.isdir(conv_dir):
+                links["transcripts"].setdefault(cid, []).append((slug, conv_dir, _dir_bytes(conv_dir)))
+    if os.path.isdir(ASSISTANT_HISTORY_ROOT):
+        for conv_dir in sorted(glob.glob(os.path.join(ASSISTANT_HISTORY_ROOT, "*"))):
+            cid = os.path.basename(conv_dir).lower()
+            if cid in wanted and os.path.isdir(conv_dir):
+                links["assistant"].setdefault(cid, []).append((conv_dir, _dir_bytes(conv_dir)))
+    return links
+
+
+def move_artifacts_to_trash(links: dict, include_assistant: bool = False) -> dict:
+    r"""把校验出的关联文件移入 transcript-trash 回收站（同盘移动，可恢复）。
+
+    布局：<TRANSCRIPT_TRASH_DIR>\<时间戳>\transcripts\<slug>\<id>\
+          <TRANSCRIPT_TRASH_DIR>\<时间戳>\assistant-history\<id>\
+    单条失败记录到 errors，不中断其余移动。返回 {"moved", "bytes", "errors"}。
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    moved = 0
+    moved_bytes = 0
+    errors: List[str] = []
+
+    def _move(src: str, dest_dir: str) -> None:
+        nonlocal moved, moved_bytes
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, os.path.basename(src))
+            if os.path.exists(dest):
+                raise FileExistsError(f"目标已存在: {dest}")
+            shutil.move(src, dest)
+            moved += 1
+            moved_bytes += _dir_bytes(dest)
+        except OSError as e:
+            errors.append(f"{src}: {e}")
+
+    for cid, entries in links.get("transcripts", {}).items():
+        for slug, path, _size in entries:
+            _move(path, os.path.join(TRANSCRIPT_TRASH_DIR, stamp, "transcripts", slug))
+    if include_assistant:
+        for cid, entries in links.get("assistant", {}).items():
+            for path, _size in entries:
+                _move(path, os.path.join(TRANSCRIPT_TRASH_DIR, stamp, "assistant-history"))
+    return {"moved": moved, "bytes": moved_bytes, "errors": errors}
+
+
+def scan_orphan_transcripts(sessions: Optional[List[Session]] = None) -> List[dict]:
+    """扫描已无对应会话的孤儿转录目录（删除会话后 Cursor 不会清理文件）。
+
+    返回 [{"slug", "path", "id", "bytes"}, ...]，按路径排序。
+    """
+    if sessions is None:
+        sessions = scan(include_hidden=True)
+    alive = {s.composer_id.lower() for s in sessions}
+    orphans: List[dict] = []
+    for slug_dir in sorted(glob.glob(os.path.join(CURSOR_PROJECTS_ROOT, "*"))):
+        if not os.path.isdir(slug_dir):
+            continue
+        slug = os.path.basename(slug_dir)
+        for conv_dir in sorted(glob.glob(os.path.join(slug_dir, "agent-transcripts", "*"))):
+            cid = os.path.basename(conv_dir)
+            if cid.lower() not in alive and os.path.isdir(conv_dir):
+                orphans.append({"slug": slug, "path": conv_dir, "id": cid, "bytes": _dir_bytes(conv_dir)})
+    return orphans
+
+
+def empty_transcript_trash() -> int:
+    """永久清空转录回收站，返回释放的字节数。目录不存在视为 0。"""
+    if not os.path.isdir(TRANSCRIPT_TRASH_DIR):
+        return 0
+    total = _dir_size(TRANSCRIPT_TRASH_DIR)
+    shutil.rmtree(TRANSCRIPT_TRASH_DIR, ignore_errors=True)
+    return total
+
+
 def print_report(classes: Dict[str, List[Session]]):
     for label, key in [("已归档", S_ARCHIVED), ("镜像残留(空壳)", S_MIRROR_ONLY),
                        ("正文孤儿(表/镜像已删)", S_CONTENT_ONLY), ("未归档", S_ACTIVE)]:
@@ -2296,6 +2486,14 @@ def op_delete_archived(args):
     print(f"将删除 {len(targets)} 个会话（归档 {len(classes[S_ARCHIVED])}，镜像残留 "
           f"{len(classes[S_MIRROR_ONLY])}，孤儿 {len(classes[S_CONTENT_ONLY])}），正文键 {key_cnt} 个")
     print("本操作不自动备份，如需留档请先用 backup-sessions 备份。")
+    # 先校验：展示将级联移入回收站的外部关联文件。
+    links = find_artifact_links({s.composer_id for s in targets}) if args.sync_transcripts else None
+    if links is not None:
+        t_cnt = sum(len(v) for v in links["transcripts"].values())
+        t_bytes = sum(size for v in links["transcripts"].values() for _, _, size in v)
+        a_cnt = sum(len(v) for v in links["assistant"].values())
+        print(f"级联校验: 转录目录 {t_cnt} 处（{_fmt_bytes(t_bytes)}）将移入 transcript-trash 回收站"
+              + (f"；第三方副本 {a_cnt} 处将一并移入" if args.include_assistant else ""))
     if not args.yes:
         if input("确认删除？[y/N] ").strip().lower() != "y":
             print("已取消。")
@@ -2304,6 +2502,57 @@ def op_delete_archived(args):
     stats = delete_sessions(targets)
     print(f"完成: 会话 {stats['sessions']}，表行 {stats['table_rows']}，"
           f"镜像 {stats['mirror'][0]} -> {stats['mirror'][1]}，正文键 {stats['keys']}")
+    if links is not None:
+        moved = move_artifacts_to_trash(links, include_assistant=args.include_assistant)
+        print(f"级联: 已移入回收站 {moved['moved']} 处"
+              f"（{_fmt_bytes(moved['bytes'])}）"
+              + (f"，失败 {len(moved['errors'])} 条" if moved["errors"] else ""))
+        for err in moved["errors"][:5]:
+            print(f"  [warn] {err}")
+
+
+def op_clean_transcripts(args):
+    """扫描并清理已无对应会话的孤儿转录目录（先校验展示，再移入回收站）。"""
+    sessions = scan(include_hidden=True)
+    orphans = scan_orphan_transcripts(sessions)
+    if not orphans:
+        print("没有孤儿转录目录，无需清理。")
+        return
+    total_bytes = sum(o["bytes"] for o in orphans)
+    print(f"发现孤儿转录目录 {len(orphans)} 个，共 {_fmt_bytes(total_bytes)}"
+          "（目录名对应的会话已不存在）：")
+    for o in orphans[:20]:
+        print(f"  [{o['slug']}] {o['id']}  {_fmt_bytes(o['bytes'])}")
+    if len(orphans) > 20:
+        print(f"  ... 其余 {len(orphans) - 20} 个略")
+    assistant_dirs: List[Tuple[str, int]] = []
+    if args.include_assistant and os.path.isdir(ASSISTANT_HISTORY_ROOT):
+        alive = {s.composer_id.lower() for s in sessions}
+        for conv_dir in sorted(glob.glob(os.path.join(ASSISTANT_HISTORY_ROOT, "*"))):
+            if os.path.basename(conv_dir).lower() not in alive and os.path.isdir(conv_dir):
+                assistant_dirs.append((conv_dir, _dir_bytes(conv_dir)))
+        if assistant_dirs:
+            print(f"第三方副本孤儿 {len(assistant_dirs)} 处"
+                  f"（{_fmt_bytes(sum(b for _, b in assistant_dirs))}）将一并移入回收站")
+    if args.dry_run:
+        print("[dry-run] 仅展示，未做任何改动。")
+        return
+    if not args.yes:
+        if input(f"确认把 {len(orphans)} 个孤儿转录目录移入 transcript-trash 回收站？[y/N] ").strip().lower() != "y":
+            print("已取消。")
+            return
+    require_closed(args.force)
+    links = {
+        "transcripts": {o["id"].lower(): [(o["slug"], o["path"], o["bytes"])] for o in orphans},
+        "assistant": {os.path.basename(p).lower(): [(p, b)] for p, b in assistant_dirs},
+    }
+    moved = move_artifacts_to_trash(links, include_assistant=args.include_assistant)
+    print(f"完成: 已移入回收站 {moved['moved']} 处"
+          f"（{_fmt_bytes(moved['bytes'])}）"
+          + (f"，失败 {len(moved['errors'])} 条" if moved["errors"] else ""))
+    for err in moved["errors"][:5]:
+        print(f"  [warn] {err}")
+    print("提示: 可在磁盘清理面板或 --op cleanup 中清空 transcript-trash 永久释放空间。")
 
 
 def op_backup_sessions(args):
@@ -2375,6 +2624,58 @@ def op_repair_mirror(args):
         finally:
             con.close()
     print(f"镜像已修复: {before} -> {after} 个条目（本操作不自动备份）")
+
+
+def op_find_session(args):
+    """按会话 ID 查找并打印会话详情（只读，不写数据库）。"""
+    if not getattr(args, "id", None) or not args.id.strip():
+        print("[err] 请用 --id 指定要查找的会话 ID（完整 UUID 或至少 4 位前缀），"
+              "例如: --op find --id 92a1bbef-4673-45b2-ad97-d4e7d412749b")
+        return
+    matches = find_sessions_by_id(args.id)
+    if not matches:
+        traces = find_session_traces(args.id)
+        if traces:
+            print(f"未找到与会话 ID “{args.id.strip()}” 匹配的会话，"
+                  "但发现该 ID 仍被以下 UI 状态键引用——会话正文数据已不存在"
+                  "（可能已被删除/清理），因此无法查看：")
+            for label, key in traces:
+                print(f"  [{label}] {key}")
+            print("提示: 可用磁盘清理面板或手动删除这些残留键。")
+        else:
+            print(f"未找到与会话 ID “{args.id.strip()}” 匹配的会话。"
+                  "可尝试更长的 ID 前缀；若该会话来自其它 Cursor 配置目录，"
+                  "本工具默认扫描 %APPDATA%\\Cursor 下的数据库。")
+        return
+    if len(matches) > 1:
+        print(f"前缀命中 {len(matches)} 个会话，请加长 ID 前缀后重试：")
+        for s in matches:
+            print(f"  {s.composer_id}  {s.display_name}  "
+                  f"{STATUS_LABEL_CLI[s.status]}  更新={fmt_ts(s.last_updated)}")
+        return
+
+    s = matches[0]
+    workspace = s.workspace_id
+    # workspaceIdentifier 可能是结构化 dict，只摘取可读的部分展示。
+    if isinstance(workspace, dict):
+        uri = workspace.get("uri") or {}
+        workspace = (workspace.get("fsPath") or uri.get("fsPath")
+                     or uri.get("path") or workspace.get("id") or str(workspace))
+    print("会话详情:")
+    print(f"  ID:          {s.composer_id}")
+    print(f"  状态:        {STATUS_LABEL_CLI[s.status]}"
+          + ("（隐藏占位副本，不在 TUI 默认列表中）" if s.hidden else ""))
+    print(f"  标题:        {s.display_name}")
+    print(f"  创建时间:    {fmt_ts(s.created_at)}")
+    print(f"  最后更新:    {fmt_ts(s.last_updated)}")
+    print(f"  消息数:      {s.message_count}")
+    print(f"  正文键数:    {s.content_keys}")
+    if workspace:
+        print(f"  工作区:      {workspace}")
+    print(f"  来源数据库:  {len(s.source_paths)} 个")
+    for p in sorted(s.source_paths):
+        print(f"    {p}")
+    print("提示: 可用 --op backup-sessions --ids " + s.composer_id + " 备份该会话。")
 
 
 def require_closed(force: bool):
@@ -2506,6 +2807,16 @@ def scan_cleanup_targets() -> List[dict]:
         "requires_closed": True,
     })
 
+    targets.append({
+        "key": "transcript_trash",
+        "label": "转录回收站（transcript-trash）",
+        "size_bytes": _dir_size(TRANSCRIPT_TRASH_DIR) if os.path.isdir(TRANSCRIPT_TRASH_DIR) else 0,
+        "files": 1 if os.path.isdir(TRANSCRIPT_TRASH_DIR) else 0,
+        "note": "删除会话时级联移入的转录文件；清空即永久释放，无法恢复",
+        "default_on": False,
+        "requires_closed": False,
+    })
+
     cache_files: List[str] = []
     cache_bytes = 0
     cursor_root = os.path.dirname(GLOBAL_STORAGE)  # %APPDATA%\Cursor
@@ -2592,6 +2903,9 @@ def run_cleanup(selected: Dict[str, bool]) -> Dict[str, int]:
             removed += size if not os.path.exists(p) else 0
         freed["cache_dirs"] = removed
 
+    if "transcript_trash" in chosen:
+        freed["transcript_trash"] = empty_transcript_trash()
+
     return freed
 
 
@@ -2642,7 +2956,9 @@ def _copy_to_clipboard(text: str) -> bool:
 
 OPS = [
     ("preview", "扫描并分类会话", op_preview),
-    ("delete-archived", "删除归档会话+残留+孤儿", op_delete_archived),
+    ("find", "按会话 ID 查找并显示详情（--id <uuid>）", op_find_session),
+    ("delete-archived", "删除归档会话+残留+孤儿（--sync-transcripts 级联转录）", op_delete_archived),
+    ("clean-transcripts", "清理孤儿转录目录（--dry-run 仅展示）", op_clean_transcripts),
     ("backup-sessions", "备份指定会话为 JSON（--ids id1,id2）", op_backup_sessions),
     ("restore-sessions", "从 JSON 备份恢复会话（--file 指定，否则列表选择）", op_restore_sessions),
     ("repair-mirror", "修复 composerHeaders 镜像", op_repair_mirror),
@@ -2752,23 +3068,42 @@ def _build_app_class(mods):
             super().__init__()
             self.index = index
 
-    class ConfirmModal(ModalScreen[bool]):
-        """确认弹窗（删除/清理等破坏性操作前使用）。"""
+    class ConfirmModal(ModalScreen[Any]):
+        """确认弹窗（删除/清理等破坏性操作前使用）。
 
-        def __init__(self, message: str, confirm_label: str = "确认删除"):
+        传入 checkboxes=[(key, label, default), ...] 时，确认按钮返回
+        (True, {key: 勾选值})、取消返回 (False, {})；否则保持旧行为，
+        返回单一 bool。
+        """
+
+        def __init__(self, message: str, confirm_label: str = "确认删除",
+                     checkboxes: Optional[List[Tuple[str, str, bool]]] = None):
             super().__init__()
             self._message = message
             self._confirm_label = confirm_label
+            self._checkboxes = checkboxes or []
 
         def compose(self) -> ComposeResult:
             with Vertical(id="confirm-box"):
                 yield Label(self._message, id="confirm-text")
+                for key, label, default in self._checkboxes:
+                    yield Checkbox(label, value=default, id=f"cb-{key}")
                 with Horizontal(id="confirm-btns"):
                     yield Button(self._confirm_label, variant="error", id="btn-yes")
                     yield Button("取消", variant="primary", id="btn-no")
 
+        def _result(self, confirmed: bool) -> Any:
+            if not self._checkboxes:
+                return confirmed
+            if not confirmed:
+                return (False, {})
+            return (True, {
+                key: self.query_one(f"#cb-{key}", Checkbox).value
+                for key, _label, _default in self._checkboxes
+            })
+
         def on_button_pressed(self, event: Button.Pressed) -> None:
-            self.dismiss(event.button.id == "btn-yes")
+            self.dismiss(self._result(event.button.id == "btn-yes"))
 
     class ExportModal(ModalScreen[Optional[str]]):
         """导出路径输入弹窗：Enter 确认返回路径，Esc 取消返回 None。
@@ -2791,6 +3126,32 @@ def _build_app_class(mods):
 
         def on_mount(self) -> None:
             self.query_one("#export-input", Input).focus()
+
+        def on_input_submitted(self, event: "Input.Submitted") -> None:
+            value = event.value.strip()
+            self.dismiss(value or None)
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+    class FindModal(ModalScreen[Optional[str]]):
+        """按会话 ID 查找的输入弹窗：Enter 提交 ID，Esc 取消返回 None。
+
+        与 ExportModal 相同，Esc 必须走 BINDINGS 消费事件，避免 dismiss
+        后同一个 Esc 继续命中下层屏幕。
+        """
+
+        BINDINGS = [Binding("escape", "cancel", "", show=False)]
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="find-box"):
+                yield Label("输入会话 ID（完整 UUID 或至少 4 位前缀，Enter 查找，Esc 取消）：",
+                            id="find-text")
+                yield Input(placeholder="例如 92a1bbef-4673-45b2-ad97-d4e7d412749b",
+                            id="find-input")
+
+        def on_mount(self) -> None:
+            self.query_one("#find-input", Input).focus()
 
         def on_input_submitted(self, event: "Input.Submitted") -> None:
             value = event.value.strip()
@@ -3328,6 +3689,8 @@ def _build_app_class(mods):
                 (ml.time, ml.summary) for ml in layout.msg_layouts if ml.is_user
             ]
             self._last_preview_index = -1
+            # on_mount 前到达的滚动/悬停消息也要能安全判空，先置 None。
+            self._rail = None
 
         def compose(self) -> ComposeResult:
             yield NoToggleHeader(show_clock=True)
@@ -3339,14 +3702,17 @@ def _build_app_class(mods):
                 yield UserIndexRail(self._user_msgs, id="user-rail")
             yield Static(id="user-preview")
             yield Static(
-                f"[[q/esc]返回  [[c]复制选中  [[e]导出md  ↑↓/PgUp/PgDn滚动  悬停圆点查看/滚轮滚动圆点链 — {_md_escape(self._title)}",
+                f"\\[q/esc]返回  \\[c]复制选中  \\[e]导出md  ↑↓/PgUp/PgDn滚动  悬停圆点查看/滚轮滚动圆点链 — {_md_escape(self._title)}",
                 id="chat-footer",
             )
 
         def on_mount(self) -> None:
             self._chat_log = self.query_one("#chat-log", ChatLog)
             self._chat_log.focus()
-            self._rail = self.query_one("#user-rail", UserIndexRail)
+            # 与 compose() 的条件严格一致：无用户消息的会话（正文被
+            # Cursor 清空、或仅剩助手消息）没有索引轨道，无条件
+            # query_one 会让这类会话在打开瞬间抛 NoMatches 直接闪退。
+            self._rail = self.query_one("#user-rail", UserIndexRail) if self._user_msgs else None
             self._preview = self.query_one("#user-preview", Static)
             # 轨道绝对定位在滚动条左侧；首次布局完成后再定位，
             # resize 时重算（此时 chat_log 的 scrollable_content_region
@@ -3358,8 +3724,12 @@ def _build_app_class(mods):
 
         def _place_rail(self) -> None:
             """把索引轨道放在正文滚动条左侧，高度封顶 3/4 屏。"""
-            if not hasattr(self, "_chat_log") or not hasattr(self, "_rail"):
-                return  # resize 事件可能先于 on_mount 的组件查询到达
+            if (
+                not hasattr(self, "_chat_log")
+                or not hasattr(self, "_rail")
+                or self._rail is None
+            ):
+                return  # resize 事件可能先于 on_mount 的组件查询到达；无用户消息会话无轨道
             content = self._chat_log.scrollable_content_region
             if content.height <= 0:
                 return
@@ -3371,14 +3741,22 @@ def _build_app_class(mods):
 
         def on_user_dot_hovered(self, event: UserDotHovered) -> None:
             event.stop()
+            if self._rail is None:
+                return  # 无用户消息的会话没有圆点可悬停
             self._update_preview(event.index, event.screen_x, event.screen_y)
 
         def on_user_dot_selected(self, event: UserDotSelected) -> None:
             event.stop()
+            if self._rail is None:
+                return
             self._chat_log.jump_to_user(event.index)
 
         def on_user_index_changed(self, event: UserIndexChanged) -> None:
             event.stop()
+            if self._rail is None:
+                # 无轨道时 ChatLog 滚动仍会发出高亮消息，忽略即可，
+                # 否则 self._rail.set_current 会抛 AttributeError。
+                return
             self._rail.set_current(event.index)
 
         def _update_preview(self, index: int, screen_x: float = 0, screen_y: float = 0) -> None:
@@ -3396,7 +3774,9 @@ def _build_app_class(mods):
                 return
             self._last_preview_index = index
             ts, summary = self._user_msgs[index]
-            self._preview.update(f"[b]{ts}[/b]\n{summary}")
+            # summary 是用户原文首行，可能含 [ ]（如 [DONE]、list[0]）；
+            # 不转义会被 Static 当作 Rich markup 解析，悬停即崩溃。
+            self._preview.update(f"[b]{ts}[/b]\n{_md_escape(summary)}")
             panel_w = min(int(self.size.width * 0.45), 70)
             est_h = 3 + (len(summary) + 59) // 60
             # 默认在鼠标右侧；放不下则移到左侧。
@@ -3459,6 +3839,7 @@ def _build_app_class(mods):
             Binding("n", "select_none", "取消全选"),
             Binding("v", "view_chat", "查看聊天"),
             Binding("c", "copy_id", "复制ID"),
+            Binding("f", "find_id", "查找ID"),
             Binding("d", "delete_selected", "删除勾选"),
             Binding("b", "do_backup", "备份"),
             Binding("x", "open_cleanup", "磁盘清理"),
@@ -3482,6 +3863,9 @@ def _build_app_class(mods):
         #export-box { width: 76; height: auto; padding: 1 2; border: thick $accent;
                      background: $surface; content-align: center middle; }
         #export-text { margin-bottom: 1; }
+        #find-box { width: 80; height: auto; padding: 1 2; border: thick $accent;
+                    background: $surface; content-align: center middle; }
+        #find-text { margin-bottom: 1; }
         #chat-footer { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
         """
 
@@ -3650,7 +4034,7 @@ def _build_app_class(mods):
                 f"Cursor: {running}  |  库 {size:.1f} MB  |  会话 {total}（归档 {arch} / 残留 {mirror} / 孤儿 {orphan}）  |  已勾选 {sel}"
             )
             self.query_one("#foot-hint", Static).update(
-                "[空格]勾选 [a]全选 [n]取消 [v]聊天 [c]复制ID [d]删除 [b]备份 [x]磁盘清理 [r]刷新 [q]退出"
+                "[空格]勾选 [a]全选 [n]取消 [v]聊天 [c]复制ID [f]查找ID [d]删除 [b]备份 [x]磁盘清理 [r]刷新 [q]退出"
             )
 
         def set_filter_buttons(self) -> None:
@@ -3772,6 +4156,91 @@ def _build_app_class(mods):
                 self.notify(f"已复制会话 ID: {cid}", timeout=4)
             else:
                 self.notify("复制失败：剪贴板不可用", severity="error", timeout=3)
+
+        def action_find_id(self) -> None:
+            """弹出输入框，按会话 ID（完整 UUID 或前缀）定位列表中的会话。"""
+            # 聊天/清理面板在台上时 f 不应冒泡进来。
+            if isinstance(self.screen, (ChatScreen, CleanupScreen)):
+                return
+
+            def _do_find(query: Optional[str]) -> None:
+                if query is None:
+                    self.notify("已取消查找", timeout=2)
+                    return
+                matches = find_sessions_by_id(query, sessions=self.sessions)
+                if not matches:
+                    # 默认列表不含隐藏占位副本；兜底全量扫描一次再查。
+                    try:
+                        full = scan(include_hidden=True)
+                    except Exception as e:
+                        self.notify(f"扫描失败: {e}", severity="error", timeout=5)
+                        return
+                    matches = find_sessions_by_id(query, sessions=full)
+                if not matches:
+                    # 会话不存在时给出可解释的原因：该 ID 可能只剩 UI 状态
+                    # 残留键（正文已被删除/清理），也可能是普通输错。
+                    traces = find_session_traces(query)
+                    if traces:
+                        sample = traces[0][1]
+                        if len(sample) > 46:
+                            sample = sample[:46] + "…"
+                        self.notify(
+                            f"未找到会话: {query}。正文数据已不存在（可能已被删除），"
+                            f"仅剩 UI 状态残留（如 {sample}）",
+                            severity="warning",
+                            timeout=8,
+                        )
+                    else:
+                        self.notify(f"未找到会话: {query}", severity="warning", timeout=5)
+                    return
+                target = matches[0]
+                if len(matches) > 1:
+                    names = "、".join(s.display_name for s in matches[:3])
+                    self.notify(
+                        f"前缀命中 {len(matches)} 个会话（{names}…），已定位最近更新的一个",
+                        timeout=6,
+                    )
+                if target.hidden:
+                    self.notify(
+                        f"该 ID 是隐藏占位副本，不在默认列表："
+                        f"{target.display_name} / {STATUS_LABEL[target.status]} / "
+                        f"正文键 {target.content_keys}",
+                        severity="warning",
+                        timeout=8,
+                    )
+                    return
+                if self._locate_session(target.composer_id):
+                    self.notify(
+                        f"已定位: {target.display_name}"
+                        f"（{STATUS_LABEL[target.status]}，更新 {fmt_ts(target.last_updated)}）"
+                        " — 按 V 查看聊天",
+                        timeout=6,
+                    )
+                else:
+                    self.notify(f"会话存在但无法定位到列表行: {target.composer_id}",
+                                severity="warning", timeout=5)
+
+            self.push_screen(FindModal(), _do_find)
+
+        def _locate_session(self, composer_id: str) -> bool:
+            """把光标定位到指定会话所在行；必要时切换筛选并重建表格。"""
+            # 目标行可能被当前筛选按钮隐藏，先切回“全部”保证可见。
+            if not any(s.composer_id == composer_id for s in self.visible_sessions()):
+                self.filter_key = "all"
+                self.set_filter_buttons()
+            # 兜底扫描后 self.sessions 可能滞后（几秒内新建的会话），
+            # 强制刷新一次让目标会话进入表格数据源。
+            if not any(s.composer_id == composer_id for s in self.sessions):
+                if not self.refresh_data(force=True):
+                    return False
+            self.rebuild_table()
+            table = self.query_one(DataTable)
+            for row_index, row in enumerate(table.ordered_rows):
+                if row.key.value == composer_id:
+                    table.move_cursor(row=row_index, scroll=True)
+                    self.current_row = row.key.value
+                    return True
+            return False
 
         def action_open_cleanup(self) -> None:
             # 聊天查看器打开时 x 不应冒泡进来；面板已在台上时也不重复压入。
@@ -3901,24 +4370,50 @@ def _build_app_class(mods):
                 )
             )
             keys = sum(s.content_keys for s in targets)
+            # 先校验：扫描会话在外部的关联文件（转录 / 第三方副本），展示给用户确认。
+            try:
+                links = find_artifact_links({s.composer_id for s in targets})
+            except OSError as e:
+                self.notify(f"扫描关联文件失败: {e}", severity="warning", timeout=5)
+                links = {"transcripts": {}, "assistant": {}}
+            t_entries = [(cid, slug, path, size)
+                         for cid, v in links["transcripts"].items() for slug, path, size in v]
+            a_entries = [(cid, path, size)
+                         for cid, v in links["assistant"].items() for path, size in v]
+            t_bytes = sum(size for *_, size in t_entries)
+            a_bytes = sum(size for _, _, size in a_entries)
+            checkboxes: Optional[List[Tuple[str, str, bool]]] = None
+            if a_entries:
+                checkboxes = [("assistant",
+                               f"同时删除第三方副本 {len(a_entries)} 处（{_fmt_bytes(a_bytes)}，属主为 .cursor-local-assistant-v2）",
+                               False)]
             msg = (
                 f"将删除 {len(targets)} 个会话\n"
                 f"勾选 {len(selected_sessions)} 个（归档 {selected_arch} / 镜像残留 {selected_mirror} / 孤儿 {selected_orphan}）\n"
                 f"+ 隐藏残留 {len(hidden_targets)} 个（归档占位 {hidden_arch} / 镜像残留 {hidden_mirror} / 孤儿 {hidden_orphan} / 同组空副本 {hidden_group}）\n"
                 f"正文键 {keys} 个\n"
+                f"关联转录 {len(t_entries)} 处（{_fmt_bytes(t_bytes)}），删除后移入 transcript-trash 回收站\n"
                 f"删除前不会自动备份，建议先按 b 备份勾选会话；且要求 Cursor 已退出。"
             )
 
-            def _ask(result: bool) -> None:
-                if not result:
+            def _ask(result: Any) -> None:
+                if isinstance(result, tuple):
+                    confirmed, options = result
+                else:
+                    confirmed, options = result, {}
+                if not confirmed:
                     self.notify("已取消", timeout=2)
                     return
                 if cursor_running():
                     self.notify("Cursor 正在运行！请先完全退出再删除。", severity="error", timeout=5)
                     return
+                include_assistant = bool(options.get("assistant"))
 
                 def _delete() -> dict:
-                    return delete_sessions(targets, vacuum=False)
+                    stats = delete_sessions(targets, vacuum=False)
+                    moved = move_artifacts_to_trash(links, include_assistant=include_assistant)
+                    stats["cascade"] = moved
+                    return stats
 
                 self._delete_worker = self.run_worker(
                     _delete, thread=True, exit_on_error=False
@@ -3931,7 +4426,7 @@ def _build_app_class(mods):
                     "数据已进入后台删除；磁盘空间可稍后按 X 打开磁盘清理，执行压缩数据库。"
                 )
 
-            self.push_screen(ConfirmModal(msg), _ask)
+            self.push_screen(ConfirmModal(msg, checkboxes=checkboxes), _ask)
 
         def _finish_delete_worker(self, worker: "Worker") -> None:
             self._delete_worker = None
@@ -3942,12 +4437,21 @@ def _build_app_class(mods):
                 self.notify(f"刷新会话列表失败: {e}", severity="error", timeout=5)
             if worker.state == WorkerState.SUCCESS:
                 self.selected.clear()
-                self.notify(
+                cascade = stats.get("cascade") or {}
+                msg = (
                     f"完成: 会话 {stats.get('sessions', 0)}，"
                     f"镜像 {stats.get('mirror', (0, 0))[0]}→{stats.get('mirror', (0, 0))[1]}，"
-                    f"正文键 {stats.get('keys', 0)}",
-                    timeout=8,
+                    f"正文键 {stats.get('keys', 0)}"
                 )
+                if cascade:
+                    msg += (f"，级联移入回收站 {cascade.get('moved', 0)} 处"
+                            f"（{_fmt_bytes(cascade.get('bytes', 0))}）")
+                    if cascade.get("errors"):
+                        msg += f"，失败 {len(cascade['errors'])} 条"
+                self.notify(msg, timeout=8)
+                if cascade.get("errors"):
+                    for err in cascade["errors"][:3]:
+                        self.notify(f"级联失败: {err}", severity="warning", timeout=8)
             else:
                 self.notify(f"删除失败: {worker.error}", severity="error", timeout=8)
 
@@ -3964,7 +4468,13 @@ def main():
     ap.add_argument("--op", choices=[n for n, _, _ in OPS], help="执行测试/自动化操作，跳过 TUI（日常使用请勿依赖）")
     ap.add_argument("--yes", action="store_true", help="跳过确认提示（配合 --op）")
     ap.add_argument("--force", action="store_true", help="跳过 Cursor 运行检测")
+    ap.add_argument("--dry-run", action="store_true", help="仅展示将要进行的改动，不执行（配合 --op clean-transcripts）")
+    ap.add_argument("--sync-transcripts", action="store_true",
+                    help="删除会话后把关联转录目录移入 transcript-trash 回收站（配合 --op delete-archived）")
+    ap.add_argument("--include-assistant", action="store_true",
+                    help="连带处理第三方副本 .cursor-local-assistant-v2\\history（配合 --sync-transcripts 或 --op clean-transcripts）")
     ap.add_argument("--ids", help="备份/操作指定的会话 ID，逗号分隔（配合 --op backup-sessions）")
+    ap.add_argument("--id", help="要查找的会话 ID（完整 UUID 或至少 4 位前缀，配合 --op find）")
     ap.add_argument("--file", help="指定备份文件路径（配合 --op restore-sessions）")
     ap.add_argument("--db", help=r"指定 state.vscdb 路径（默认 %%APPDATA%%\Cursor\...；测试用）")
     args = ap.parse_args()
@@ -3987,3 +4497,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
