@@ -86,6 +86,9 @@ SEARCH_INDEX = os.path.join(GLOBAL_STORAGE, "conversation-search.db")
 # workspaceStorage/<workspace>/state.vscdb。旧版本/API key 场景通常只会
 # 命中前者，因此原来只打开 DB 的实现会漏掉账号登录后的会话。
 WORKSPACE_STORAGE = os.path.join(os.path.dirname(GLOBAL_STORAGE), "workspaceStorage")
+# Electron 应用根目录（%APPDATA%\Cursor）：globalStorage 在 User 下再深一层，
+# Cache/logs 等 userData 目录都在这一层，dirname 一次只能到 User 层。
+CURSOR_APP_ROOT = os.path.dirname(os.path.dirname(GLOBAL_STORAGE))
 DB_DISCOVERY_ENABLED = True
 
 # 会话列表的 ItemTable key 在 Cursor 版本之间发生过变化。保留旧 key，
@@ -1250,6 +1253,18 @@ def _tokens_to_text(tokens) -> str:
     转义，保证只有这里刻意输出的样式标记会被 Rich 解析。
     """
     parts: List[str] = []
+
+    def add_tag(tag: str) -> None:
+        """输出生成标签。标签紧贴前一段用户文本时，其段末反斜杠串
+        必须为偶数个，否则标签被中和（奇数会让对应闭合标签失配，
+        ChatLog 渲染直接 MarkupError），补齐到偶数不改变渲染结果。"""
+        if parts:
+            last = parts[-1]
+            k = len(last) - len(last.rstrip("\\"))
+            if k:
+                parts[-1] = last + ("\\" * k)
+        parts.append(tag)
+
     for tok in tokens:
         if tok.type == "text":
             # 消息原文可能含 [ ]（日志、代码、markdown 任务列表等），
@@ -1259,19 +1274,21 @@ def _tokens_to_text(tokens) -> str:
         elif tok.type == "softbreak" or tok.type == "hardbreak":
             parts.append("\n")
         elif tok.type == "code_inline":
-            parts.append(f"[r]{_md_escape(tok.content)}[/]")
+            add_tag("[r]")
+            parts.append(_md_escape(tok.content))
+            add_tag("[/]")
         elif tok.type == "strong_open":
-            parts.append("[b]")
+            add_tag("[b]")
         elif tok.type == "strong_close":
-            parts.append("[/b]")
+            add_tag("[/b]")
         elif tok.type == "em_open":
-            parts.append("[i]")
+            add_tag("[i]")
         elif tok.type == "em_close":
-            parts.append("[/i]")
+            add_tag("[/i]")
         elif tok.type == "s_open":
-            parts.append("[s]")
+            add_tag("[s]")
         elif tok.type == "s_close":
-            parts.append("[/s]")
+            add_tag("[/s]")
         elif tok.type == "link_open":
             # 链接只保留文字，丢弃 URL（终端里 URL 太长且不可点）
             pass
@@ -1288,20 +1305,88 @@ def _tokens_to_text(tokens) -> str:
     return "".join(parts)
 
 
-def _md_escape(text: str) -> str:
-    """把普通文本转成 Rich markup 安全形式（避免 [ 被当作样式解析）。
+_MD_TAG_FORM = re.compile(r"\\*\[[a-z#/@][^[]*?\]")
 
-    Rich 的转义符是反斜杠：`\\[x]` 渲染为字面 [x]。`[[` 并不是转义——
-    第二个 [ 仍会与后续字符组成标签（[[/x] 会解析出不匹配的闭合标签
-    [/x]，ChatLog 渲染时直接 MarkupError 闪退）。因此按
-    rich.markup.escape 的语义：仅给标签样式的 [seq] 前插反斜杠并保留
-    原文已有的反斜杠配对，非标签形式（如 [DONE]、list[0]）原样保留。
+
+def _md_escape(text: str) -> str:
+    """把普通文本转成 Rich markup 安全形式（整段按字面渲染）。
+
+    Rich 的解析规则（rich.markup._parse）：
+      - 标签形 [seq]（seq 以 [a-z#/@] 开头）前的反斜杠串按 divmod(N, 2)
+        处理：N 偶数 → N//2 个字面反斜杠且标签生效；N 奇数 → N//2 个
+        字面反斜杠且标签按字面显示；
+      - 非标签文本中的 `\\[` 一律还原为 `[`（吞掉一个反斜杠）；
+      - 其余反斜杠原样渲染。
+
+    据此本函数：
+      1) 标签形前的反斜杠串 N 改写为 2N+1：奇数让标签失效，且渲染出
+         的反斜杠数恰为 N，与原文一致；
+      2) 非标签形 [ 前的反斜杠串 N 改写为 N+1：抵消 `\\[` 还原吞掉的
+         一个反斜杠；
+      3) 段末反斜杠串保持 N 不变——其后拼接的是标签还是普通文本决定
+         是否需要补齐，由调用方用 _md_escape_tagged 处理。
+
+    注意 `[[` 并不是 Rich 的转义（[[/x] 会解析出不匹配的闭合标签
+    [/x]，ChatLog 渲染直接 MarkupError 闪退），也不能直接用
+    rich.markup.escape（它保留原文反斜杠配对，`\\[b]` 会让标签生效）。
     """
+    if not text:
+        return text
     if "[" not in text:
         return text
-    from rich.markup import escape as _rich_escape
+    out: List[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = _MD_TAG_FORM.match(text, pos)
+        if m:
+            run = len(m.group()) - len(m.group().lstrip("\\"))
+            out.append("\\" * (2 * run + 1))
+            out.append(m.group()[run:])
+            pos = m.end()
+            continue
+        ch = text[pos]
+        if ch != "\\":
+            out.append(ch)
+            pos += 1
+            continue
+        run_start = pos
+        while pos < n and text[pos] == "\\":
+            pos += 1
+        run_len = pos - run_start
+        if pos < n and text[pos] == "[":
+            # 非标签形 [：Rich 会把 \[ 还原为 [，多补 1 个反斜杠抵消
+            out.append("\\" * (run_len + 1))
+        else:
+            out.append(text[run_start:pos])
+    return "".join(out)
 
-    return _rich_escape(text)
+
+def _md_escape_tagged(text: str) -> str:
+    """_md_escape 的变体：结果紧接着拼接生成标签时使用。
+
+    生成标签前的反斜杠串必须为偶数个，否则标签被中和——开标签失效
+    会让对应的闭合标签失配，直接 MarkupError 闪退。把段末反斜杠串
+    双写为 2N 个后，标签生效且渲染出 N 个字面反斜杠，与原文一致。
+    """
+    escaped = _md_escape(text)
+    k = len(escaped) - len(escaped.rstrip("\\"))
+    return escaped + ("\\" * k) if k else escaped
+
+
+def _safe_from_markup(line: str):
+    r"""Text.from_markup 的防崩包装：转义残留漏洞时退化为纯文本。
+
+    append_block 按终端宽度截断渲染行时可能把转义序列拦腰截断
+    （如 \\\[/b] 截成 \\[/b]，闭合标签被激活），任何此类残留都
+    不能让聊天页闪退，最多损失该行样式。返回 rich.text.Text。
+    """
+    from rich.text import Text as _Text
+
+    try:
+        return _Text.from_markup(line)
+    except Exception:
+        return _Text(line)
 
 
 @dataclass
@@ -1464,14 +1549,14 @@ def build_chat_layout(msgs: List[dict], width: int, title: str = "") -> ChatLayo
                     lines_out.append(rendered)
 
     if not msgs:
-        lines.append(f"[b]{_md_escape(title or '会话')}[/]")
+        lines.append(f"[b]{_md_escape_tagged(title or '会话')}[/]")
         lines.append("")
         lines.append("_（无聊天记录或已无正文数据）_")
         layout.lines = lines
         layout.total_lines = len(lines)
         return layout
 
-    lines.append(f"[b]{_md_escape(title or '会话')}[/]")
+    lines.append(f"[b]{_md_escape_tagged(title or '会话')}[/]")
     lines.append(f"共 {len(msgs)} 条消息")
     lines.append("")
 
@@ -1495,7 +1580,14 @@ def build_chat_layout(msgs: List[dict], width: int, title: str = "") -> ChatLayo
             lines.append("")
         for tool in m.get("tools") or []:
             st = f" [{tool['status']}]" if tool.get("status") else ""
-            lines.append(f"[dim]🔧 {_md_escape(tool['name'])}{_md_escape(st)}[/]")
+            if st:
+                # st 以空格开头，名称段与 st 之间是普通文本拼接；
+                # st 末尾紧贴收尾标签 [/]，需要按标签拼接语义转义。
+                name_esc = _md_escape(tool["name"])
+            else:
+                # 无状态时名称段直接贴 [/]，按标签拼接语义转义。
+                name_esc = _md_escape_tagged(tool["name"])
+            lines.append(f"[dim]🔧 {name_esc}{_md_escape_tagged(st)}[/]")
             detail = tool.get("detail") or ""
             if detail:
                 if len(detail) > 220:
@@ -1682,12 +1774,19 @@ def remove_keys_for(con: sqlite3.Connection, cid: str) -> int:
 
     if not keys_to_delete:
         return 0
-    placeholders = ",".join("?" for _ in keys_to_delete)
-    cur = con.execute(
-        f"DELETE FROM cursorDiskKV WHERE key IN ({placeholders})",
-        keys_to_delete,
-    )
-    return int(cur.rowcount)
+    # 分批执行：SQLite 变量上限 32766（老版本 999），单发 IN 会在
+    # 超大会话（正文键数极多）时抛 "too many SQL variables"，导致
+    # 整个删除失败回滚。
+    deleted = 0
+    for i in range(0, len(keys_to_delete), 500):
+        batch = keys_to_delete[i:i + 500]
+        placeholders = ",".join("?" for _ in batch)
+        cur = con.execute(
+            f"DELETE FROM cursorDiskKV WHERE key IN ({placeholders})",
+            batch,
+        )
+        deleted += max(int(cur.rowcount), 0)
+    return deleted
 
 
 def rewrite_mirror(con: sqlite3.Connection, delete_ids: Set[str]) -> Tuple[int, int]:
@@ -1880,15 +1979,19 @@ def _collect_session_kv(con: sqlite3.Connection, cid: str) -> List[Tuple[str, An
 
     if not keys:
         return []
-    placeholders = ",".join("?" for _ in keys)
-    try:
+    # 分批执行：SQLite 变量上限 32766（老版本 999），单发 IN 会在
+    # 超大会话时抛 "too many SQL variables"。此处绝不能吞异常返回空：
+    # 键已确认存在却读不出来时返回 []，备份会静默变成空壳（数据丢失）。
+    collected: List[Tuple[str, Any]] = []
+    for i in range(0, len(keys), 500):
+        batch = keys[i:i + 500]
+        placeholders = ",".join("?" for _ in batch)
         rows = con.execute(
             f"SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})",
-            keys,
+            batch,
         ).fetchall()
-    except sqlite3.DatabaseError:
-        return []
-    return [(str(key), value) for key, value in rows]
+        collected.extend((str(key), value) for key, value in rows)
+    return collected
 
 
 def _collect_mirror_headers(con: sqlite3.Connection, cid: str) -> List[dict]:
@@ -1989,8 +2092,6 @@ def collect_session_records(sessions: List[Session]) -> List[dict]:
                 if record["table_row"] is None and not record["mirror_headers"] and not record["kv"]:
                     continue
                 records.append(record)
-        except sqlite3.DatabaseError:
-            continue
         finally:
             con.close()
     return records
@@ -2552,7 +2653,7 @@ def op_clean_transcripts(args):
           + (f"，失败 {len(moved['errors'])} 条" if moved["errors"] else ""))
     for err in moved["errors"][:5]:
         print(f"  [warn] {err}")
-    print("提示: 可在磁盘清理面板或 --op cleanup 中清空 transcript-trash 永久释放空间。")
+    print("提示: 可在磁盘清理面板（TUI 按 X）中清空 transcript-trash 永久释放空间。")
 
 
 def op_backup_sessions(args):
@@ -2569,9 +2670,25 @@ def op_backup_sessions(args):
     if not sessions:
         print("[err] 没有找到与 --ids 匹配的会话。")
         return
-    out = backup_sessions(sessions)
-    kv = sum(s.content_keys for s in sessions)
-    print(f"已备份 {len(sessions)} 个会话（正文键 {kv} 个）: {out}")
+    try:
+        out = backup_sessions(sessions)
+    except sqlite3.DatabaseError as e:
+        print(f"[err] 备份失败（数据库读取错误）: {e}")
+        print("      已放弃写出不完整的存档，请检查数据库文件后重试。")
+        return
+    # 如实报告：成功提示若取扫描计数，读库失败时会掩盖"备份实为空壳"。
+    expected = sum(s.content_keys for s in sessions)
+    try:
+        with open(out, "r", encoding="utf-8") as f:
+            written = sum(len(r.get("kv") or []) for r in json.load(f).get("sessions", []))
+    except (OSError, ValueError):
+        print(f"已备份 {len(sessions)} 个会话: {out}")
+        print("[warn] 写入后校验失败，无法确认存档完整性，请手动检查文件。")
+        return
+    if expected and written < expected:
+        print(f"[warn] 已备份 {len(sessions)} 个会话，但实际写入正文键 {written} 个，"
+              f"少于扫描到的 {expected} 个，存档可能不完整，请勿删除原会话！")
+    print(f"已备份 {len(sessions)} 个会话（正文键 {written} 个）: {out}")
 
 
 def op_restore_sessions(args):
@@ -2688,8 +2805,8 @@ def require_closed(force: bool):
 # 磁盘清理（TUI 共用；纯函数，不依赖 UI）
 # =====================================================================
 
-# 可清理类目的固定顺序
-CLEANUP_TARGETS = ("backups", "search_index", "vacuum", "cache_dirs")
+# 可清理类目的固定顺序（与 scan_cleanup_targets/run_cleanup 的 key 一致）
+CLEANUP_TARGETS = ("backups", "search_index", "vacuum", "transcript_trash", "cache_dirs")
 # 需要 Cursor 完全退出才能安全清理的类目
 CLEANUP_NEEDS_CLOSED = frozenset({"vacuum", "cache_dirs"})
 
@@ -2819,7 +2936,7 @@ def scan_cleanup_targets() -> List[dict]:
 
     cache_files: List[str] = []
     cache_bytes = 0
-    cursor_root = os.path.dirname(GLOBAL_STORAGE)  # %APPDATA%\Cursor
+    cursor_root = CURSOR_APP_ROOT  # %APPDATA%\Cursor（缓存不在 User 层下）
     for name in CACHE_DIR_NAMES:
         p = os.path.join(cursor_root, name)
         if os.path.isdir(p):
@@ -2893,7 +3010,7 @@ def run_cleanup(selected: Dict[str, bool]) -> Dict[str, int]:
 
     if "cache_dirs" in chosen:
         removed = 0
-        cursor_root = os.path.dirname(GLOBAL_STORAGE)
+        cursor_root = CURSOR_APP_ROOT
         for name in CACHE_DIR_NAMES:
             p = os.path.join(cursor_root, name)
             if not os.path.isdir(p):
@@ -3441,13 +3558,11 @@ def _build_app_class(mods):
 
         def _viewport_plain_lines(self) -> List[str]:
             """视口内各行的纯文本（去 markup），与屏幕行一一对应。"""
-            from rich.text import Text
-
             lines = self._layout.lines
             if not lines:
                 return []
             sy, height = self._viewport_range()
-            return [Text.from_markup(line).plain for line in lines[sy: sy + height]]
+            return [_safe_from_markup(line).plain for line in lines[sy: sy + height]]
 
         def _ordered_selection(self) -> "Optional[Tuple[Tuple[int, int], Tuple[int, int]]]":
             """锚点/焦点排序为 (start, end)；单击未拖动返回 None。"""
@@ -3508,7 +3623,6 @@ def _build_app_class(mods):
 
         def render(self) -> RenderResult:
             lines = self._layout.lines
-            total = self._layout.total_lines
             if not lines:
                 return ""
             sy, height = self._viewport_range()
@@ -3524,7 +3638,7 @@ def _build_app_class(mods):
 
             rendered: List[Text] = []
             for row, line in enumerate(lines[sy: sy + height]):
-                text = Text.from_markup(line)
+                text = _safe_from_markup(line)
                 if ordered is not None:
                     span = _selection_row_span(row, cell_len(text.plain), sel_start, sel_end)
                     if span is not None:

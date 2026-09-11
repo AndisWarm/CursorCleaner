@@ -156,7 +156,6 @@ def _split_long_paragraphs(lines: List[str]) -> List[str]:
     """超过阈值行数且不含列表/引用标记的连续文本，按行分组插入空行。"""
     if len(lines) <= _LONG_PARAGRAPH_LINES:
         return lines
-    in_block = False
     block: List[str] = []
     result: List[str] = []
 

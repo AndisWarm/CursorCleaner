@@ -45,3 +45,6 @@ backups/
 # Tests (kept locally, not shipped in the repo)
 tests/
 .pytest_cache/
+
+# Local bug-check scratch scripts (verification leftovers)
+_bugcheck_*.py
