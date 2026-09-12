@@ -37,6 +37,9 @@ backups/
 .vscode/
 .idea/
 
+# Agent tool session artifacts (ZCode)
+.zcode/
+
 # Local environment and secrets
 .env
 .env.*
@@ -45,6 +48,7 @@ backups/
 # Tests (kept locally, not shipped in the repo)
 tests/
 .pytest_cache/
+.ruff_cache/
 
 # Local bug-check scratch scripts (verification leftovers)
 _bugcheck_*.py
