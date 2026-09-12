@@ -1728,49 +1728,77 @@ def export_conversation_md(cid: str, name: str, msgs: List[dict], out_path: str)
     return target
 
 
+def _session_bubble_ids(con: sqlite3.Connection, cid: str) -> Set[str]:
+    """从 composerData 精确键与分片键解析会话引用的全部 bubbleId。
+
+    composerData:<cid>:<分片> 形态的键与精确键同为会话正文数据源
+    （与扫描侧 _scan_content_db 一致）；只读精确键会漏掉分片引用的
+    无 composerId bubble，导致删除残留 / 备份缺正文。
+    """
+    bubble_ids: Set[str] = set()
+    base = f"composerData:{cid}"
+    try:
+        rows = con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key>=? AND key<?",
+            (base, base + ":\uffff"),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return bubble_ids
+    for key, value in rows:
+        key = str(key)
+        if key != base and not key.startswith(base + ":"):
+            continue
+        for header in _conversation_headers(value):
+            bid = _bubble_id(header)
+            if bid:
+                bubble_ids.add(bid)
+    return bubble_ids
+
+
+def _session_kv_key_match(key: str, cid: str, bubble_ids: Set[str]) -> bool:
+    """判断 cursorDiskKV 键是否属于会话（删除与备份共用同一口径）。
+
+    除直接前缀外，还通过无 composerId 段的 bubbleId:<bid> 反向关联。
+    形如 bubble:<other_cid>:<bid> 且首段不是本会话的键一律不算：bubble
+    可能被 fork/子任务跨会话共享，按"任一段匹配"删除会连带删掉其它
+    活跃会话的正文键（不可恢复）；宁可留下极少量孤儿键，后续清理可再处理。
+    """
+    if (
+        key == f"composerData:{cid}"
+        or key.startswith(f"composerData:{cid}:")
+        or key == f"composerVirtualRowHeights:{cid}"
+        or key.startswith(f"composerVirtualRowHeights:{cid}:")
+        or key.startswith(f"bubbleId:{cid}:")
+        or key == f"checkpointId:{cid}"
+        or key.startswith(f"checkpointId:{cid}:")
+        or key == f"ofsContent:{cid}"
+        or key.startswith(f"ofsContent:{cid}:")
+    ):
+        return True
+    if bubble_ids and key.startswith(("bubbleId:", "bubble:")):
+        segments = key.split(":")[1:]
+        if len(segments) >= 2 and segments[0] != cid:
+            return False
+        return any(bid in segments for bid in bubble_ids)
+    return False
+
+
 def remove_keys_for(con: sqlite3.Connection, cid: str) -> int:
-    """删除一个会话的所有正文键，返回删除行数。"""
+    """删除一个会话的所有正文键，返回删除行数。
+
+    键扫描/删除失败时抛出异常而不是静默返回 0：调用方（delete_sessions）
+    按库统一回滚并上报，避免"表行已删、正文残留"的静默半状态。
+    """
     if not _table_exists(con, "cursorDiskKV"):
         return 0
 
-    # 先从 composerData 取出无 composerId 的 bubbleId，账号登录版本会
-    # 使用 bubbleId:<bubbleId>，不能只靠 bubbleId:<composerId>:% 删除。
-    bubble_ids: Set[str] = set()
-    try:
-        row = con.execute(
-            "SELECT value FROM cursorDiskKV WHERE key=?",
-            (f"composerData:{cid}",),
-        ).fetchone()
-        if row:
-            for header in _conversation_headers(row[0]):
-                bid = _bubble_id(header)
-                if bid:
-                    bubble_ids.add(bid)
-    except sqlite3.DatabaseError:
-        pass
+    bubble_ids = _session_bubble_ids(con, cid)
 
     keys_to_delete: List[str] = []
-    try:
-        for (key_value,) in con.execute("SELECT key FROM cursorDiskKV"):
-            key = str(key_value)
-            if (
-                key == f"composerData:{cid}"
-                or key.startswith(f"composerData:{cid}:")
-                or key == f"composerVirtualRowHeights:{cid}"
-                or key.startswith(f"composerVirtualRowHeights:{cid}:")
-                or key.startswith(f"bubbleId:{cid}:")
-                or key == f"checkpointId:{cid}"
-                or key.startswith(f"checkpointId:{cid}:")
-                or key == f"ofsContent:{cid}"
-                or key.startswith(f"ofsContent:{cid}:")
-            ):
-                keys_to_delete.append(key)
-                continue
-            if bubble_ids and key.startswith(("bubbleId:", "bubble:")):
-                if any(bid in key.split(":")[1:] for bid in bubble_ids):
-                    keys_to_delete.append(key)
-    except sqlite3.DatabaseError:
-        return 0
+    for (key_value,) in con.execute("SELECT key FROM cursorDiskKV"):
+        key = str(key_value)
+        if _session_kv_key_match(key, cid, bubble_ids):
+            keys_to_delete.append(key)
 
     if not keys_to_delete:
         return 0
@@ -1789,17 +1817,59 @@ def remove_keys_for(con: sqlite3.Connection, cid: str) -> int:
     return deleted
 
 
+def _utf8_safe(text: str) -> str:
+    r"""清掉 JSON 转义残留的未配对代理字符（\ud800 等），保证可编码为 UTF-8。
+
+    _decode_json 的 errors="replace" 只处理字节级乱码；源文本中的
+    \\udXXX 转义会还原成 str 里的 lone surrogate，json.dumps 后
+    encode("utf-8") 直接抛 UnicodeEncodeError。
+    """
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _mirror_containers(data: Any) -> List[Tuple[dict, str]]:
+    """找出镜像 JSON 中的会话列表容器，返回 (parent dict, key) 列表。
+
+    读取侧 _extract_composer_headers 递归支持 data/state/payload 等嵌套
+    形态；写入侧此前只认顶层容器，嵌套形态的镜像会静默不更新（删除后
+    Cursor 重启重现空壳条目）。此处对齐为深度受限的递归查找。
+    """
+    found: List[Tuple[dict, str]] = []
+    visited: Set[int] = set()
+
+    def visit(node: Any, depth: int = 0) -> None:
+        if depth > 7 or not isinstance(node, dict):
+            return
+        marker = id(node)
+        if marker in visited:
+            return
+        visited.add(marker)
+        for key in ("allComposers", "composers", "composerHeaders", "items"):
+            if isinstance(node.get(key), list):
+                found.append((node, key))
+        for key, child in node.items():
+            if isinstance(child, (dict, list)) and (
+                key in {"data", "state", "value", "payload", "result"}
+                or "composer" in key.lower()
+            ):
+                visit(child, depth + 1)
+
+    visit(data)
+    return found
+
+
 def rewrite_mirror(con: sqlite3.Connection, delete_ids: Set[str]) -> Tuple[int, int]:
     """更新不同 Cursor 版本的会话列表镜像，不丢失活动会话。"""
     if not _table_exists(con, "ItemTable"):
         return 0, 0
     table_map = _read_composer_table(con)
-    try:
-        rows = con.execute(
-            "SELECT key, value FROM ItemTable WHERE key LIKE 'composer.%'"
-        ).fetchall()
-    except sqlite3.DatabaseError:
-        return 0, 0
+    rows = con.execute(
+        "SELECT key, value FROM ItemTable WHERE key LIKE 'composer.%'"
+    ).fetchall()
 
     total_before = 0
     total_after = 0
@@ -1812,83 +1882,72 @@ def rewrite_mirror(con: sqlite3.Connection, delete_ids: Set[str]) -> Tuple[int, 
         if not isinstance(data, dict):
             continue
 
-        # 绝大多数版本使用 allComposers；同时兼容 composers/items 容器。
-        container_key = next(
-            (
-                key for key in ("allComposers", "composers", "composerHeaders", "items")
-                if isinstance(data.get(key), list)
-            ),
-            None,
-        )
-        if container_key is None:
-            continue
-        headers = data[container_key]
-        before = len(headers)
-        kept: List[Any] = []
-        seen: Set[str] = set()
-        for header in headers:
-            if not isinstance(header, dict):
-                kept.append(header)
-                continue
-            header_cid = _header_id(header.get("composerId") or header.get("composerID"))
-            if header_cid in delete_ids:
-                continue
-            normalized = dict(header)
-            meta = table_map.get(header_cid)
-            # 镜像的 isArchived 是权威来源：新版 Cursor 归档只写 ItemTable
-            # 镜像，composerHeaders 表的 isArchived 已停止更新、可能过时。
-            # 只用表行在镜像缺失该字段时兜底，绝不能反过来覆盖镜像值，
-            # 否则删除一个会话会把其余"表 0 + 镜像 1"的归档会话全部
-            # 误改成未归档（反之亦然）。
-            if meta is not None and "isArchived" not in normalized:
-                normalized["isArchived"] = _as_bool(meta.get("isArchived"))
-            kept.append(normalized)
-            if header_cid:
-                seen.add(header_cid)
+        for container_parent, container_key in _mirror_containers(data):
+            headers = container_parent[container_key]
+            before = len(headers)
+            kept: List[Any] = []
+            seen: Set[str] = set()
+            for header in headers:
+                if not isinstance(header, dict):
+                    kept.append(header)
+                    continue
+                header_cid = _header_id(header.get("composerId") or header.get("composerID"))
+                if header_cid in delete_ids:
+                    continue
+                normalized = dict(header)
+                meta = table_map.get(header_cid)
+                # 镜像的 isArchived 是权威来源：新版 Cursor 归档只写 ItemTable
+                # 镜像，composerHeaders 表的 isArchived 已停止更新、可能过时。
+                # 只用表行在镜像缺失该字段时兜底，绝不能反过来覆盖镜像值，
+                # 否则删除一个会话会把其余"表 0 + 镜像 1"的归档会话全部
+                # 误改成未归档（反之亦然）。
+                if meta is not None and "isArchived" not in normalized:
+                    normalized["isArchived"] = _as_bool(meta.get("isArchived"))
+                kept.append(normalized)
+                if header_cid:
+                    seen.add(header_cid)
 
-        # 兼容原有 repair-mirror 行为：表中存在但镜像缺少的活动会话重新补入。
-        missing: List[dict] = []
-        for composer_id, meta in table_map.items():
-            if composer_id in delete_ids or composer_id in seen or _as_bool(meta.get("isArchived")) or _as_bool(meta.get("isSubagent")):
-                continue
-            candidate = meta.get("value")
-            if not isinstance(candidate, dict):
-                continue
-            normalized = dict(candidate)
-            normalized["composerId"] = composer_id
-            normalized["isArchived"] = False
-            if "createdAt" not in normalized and meta.get("createdAt") is not None:
-                normalized["createdAt"] = meta["createdAt"]
-            if "lastUpdatedAt" not in normalized and meta.get("lastUpdatedAt") is not None:
-                normalized["lastUpdatedAt"] = meta["lastUpdatedAt"]
-            if "workspaceIdentifier" not in normalized and meta.get("workspaceIdentifier"):
-                normalized["workspaceIdentifier"] = meta["workspaceIdentifier"]
-            missing.append(normalized)
+            # 兼容原有 repair-mirror 行为：表中存在但镜像缺少的活动会话重新补入。
+            missing: List[dict] = []
+            for composer_id, meta in table_map.items():
+                if composer_id in delete_ids or composer_id in seen or _as_bool(meta.get("isArchived")) or _as_bool(meta.get("isSubagent")):
+                    continue
+                candidate = meta.get("value")
+                if not isinstance(candidate, dict):
+                    continue
+                normalized = dict(candidate)
+                normalized["composerId"] = composer_id
+                normalized["isArchived"] = False
+                if "createdAt" not in normalized and meta.get("createdAt") is not None:
+                    normalized["createdAt"] = meta["createdAt"]
+                if "lastUpdatedAt" not in normalized and meta.get("lastUpdatedAt") is not None:
+                    normalized["lastUpdatedAt"] = meta["lastUpdatedAt"]
+                if "workspaceIdentifier" not in normalized and meta.get("workspaceIdentifier"):
+                    normalized["workspaceIdentifier"] = meta["workspaceIdentifier"]
+                missing.append(normalized)
 
-        missing.sort(
-            key=lambda item: (
-                _as_int(item.get("lastUpdatedAt") or item.get("createdAt")) or 0,
-                item.get("composerId", ""),
-            ),
-            reverse=True,
-        )
-        data[container_key] = missing + kept
-        after = len(data[container_key])
-        total_before += before
-        total_after += after
+            missing.sort(
+                key=lambda item: (
+                    _as_int(item.get("lastUpdatedAt") or item.get("createdAt")) or 0,
+                    item.get("composerId", ""),
+                ),
+                reverse=True,
+            )
+            container_parent[container_key] = missing + kept
+            after = len(container_parent[container_key])
+            total_before += before
+            total_after += after
 
-        serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        if isinstance(original_value, str):
-            payload = serialized
-        elif isinstance(original_value, memoryview):
-            payload = serialized.encode("utf-8")
-        else:
-            payload = serialized.encode("utf-8")
-        con.execute(
-            "UPDATE ItemTable SET value=? WHERE key=?",
-            (payload, item_key),
-        )
-        changed = True
+            serialized = _utf8_safe(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+            if isinstance(original_value, str):
+                payload = serialized
+            else:
+                payload = serialized.encode("utf-8")
+            con.execute(
+                "UPDATE ItemTable SET value=? WHERE key=?",
+                (payload, item_key),
+            )
+            changed = True
 
     if not changed:
         return 0, 0
@@ -1932,56 +1991,28 @@ def _decode_backup_value(obj: Any) -> Any:
 def _collect_session_kv(con: sqlite3.Connection, cid: str) -> List[Tuple[str, Any]]:
     """收集一个库中某会话的全部 cursorDiskKV 键值。
 
-    键匹配规则与 remove_keys_for() 对称：直接前缀匹配 + 从
-    composerData 消息头反向关联无 composerId 的 bubbleId:<bid>。
-    返回 [(key, value), ...]，value 为已解码的原始 SQLite 值。
+    键匹配规则与 remove_keys_for() 共用 _session_kv_key_match()：
+    直接前缀匹配 + 从 composerData（含分片键）消息头反向关联无
+    composerId 的 bubbleId:<bid>。返回 [(key, value), ...]。
+
+    键扫描失败时抛出异常而不是返回 []：键已确认存在却读不出来时
+    返回空列表，备份会静默变成空壳（数据丢失）。
     """
     if not _table_exists(con, "cursorDiskKV"):
         return []
 
-    # 先解析 composerData 拿到无 composerId 的 bubbleId，与删除逻辑一致。
-    bubble_ids: Set[str] = set()
-    try:
-        row = con.execute(
-            "SELECT value FROM cursorDiskKV WHERE key=?",
-            (f"composerData:{cid}",),
-        ).fetchone()
-        if row:
-            for header in _conversation_headers(row[0]):
-                bid = _bubble_id(header)
-                if bid:
-                    bubble_ids.add(bid)
-    except sqlite3.DatabaseError:
-        pass
+    bubble_ids = _session_bubble_ids(con, cid)
 
     keys: List[str] = []
-    try:
-        for (key_value,) in con.execute("SELECT key FROM cursorDiskKV"):
-            key = str(key_value)
-            if (
-                key == f"composerData:{cid}"
-                or key.startswith(f"composerData:{cid}:")
-                or key == f"composerVirtualRowHeights:{cid}"
-                or key.startswith(f"composerVirtualRowHeights:{cid}:")
-                or key.startswith(f"bubbleId:{cid}:")
-                or key == f"checkpointId:{cid}"
-                or key.startswith(f"checkpointId:{cid}:")
-                or key == f"ofsContent:{cid}"
-                or key.startswith(f"ofsContent:{cid}:")
-            ):
-                keys.append(key)
-                continue
-            if bubble_ids and key.startswith(("bubbleId:", "bubble:")):
-                if any(bid in key.split(":")[1:] for bid in bubble_ids):
-                    keys.append(key)
-    except sqlite3.DatabaseError:
-        return []
+    for (key_value,) in con.execute("SELECT key FROM cursorDiskKV"):
+        key = str(key_value)
+        if _session_kv_key_match(key, cid, bubble_ids):
+            keys.append(key)
 
     if not keys:
         return []
     # 分批执行：SQLite 变量上限 32766（老版本 999），单发 IN 会在
-    # 超大会话时抛 "too many SQL variables"。此处绝不能吞异常返回空：
-    # 键已确认存在却读不出来时返回 []，备份会静默变成空壳（数据丢失）。
+    # 超大会话时抛 "too many SQL variables"。
     collected: List[Tuple[str, Any]] = []
     for i in range(0, len(keys), 500):
         batch = keys[i:i + 500]
@@ -2109,9 +2140,25 @@ def backup_sessions(sessions: List[Session]) -> str:
         "sessions": collect_session_records(sessions),
     }
     ts = time.strftime("%Y%m%d-%H%M%S")
-    out_path = os.path.join(os.path.dirname(DB), f"sessions-backup-{ts}.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    out_dir = os.path.dirname(DB)
+    out_path = os.path.join(out_dir, f"sessions-backup-{ts}.json")
+    # 秒级时间戳在快速连续备份时会撞名；追加序号而不是静默覆盖旧备份。
+    seq = 0
+    while os.path.exists(out_path):
+        seq += 1
+        out_path = os.path.join(out_dir, f"sessions-backup-{ts}-{seq}.json")
+    # 先写临时文件再原子替换：进程中断/磁盘满不会留下半写的损坏存档。
+    tmp_path = out_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     return out_path
 
 
@@ -2143,14 +2190,17 @@ def _restore_table_row(con: sqlite3.Connection, cid: str, table_row: dict) -> bo
     return True
 
 
-def _restore_mirror_headers(con: sqlite3.Connection, headers: List[dict]) -> int:
+def _restore_mirror_headers(con: sqlite3.Connection, headers: List[dict]) -> Tuple[int, int]:
     """把备份的镜像 header 放回原 ItemTable 条目；已存在则跳过。
 
-    只做"容器内 append 缺失的 cid"，不改动容器结构与排序。返回新增数。
+    只做"容器内 append 缺失的 cid"，不改动容器结构与排序。
+    返回 (新增数, 镜像行缺失跳过数)——镜像行整条不存在时（该库从未有
+    对应 ItemTable 条目）此前静默丢弃，恢复统计无法如实体现。
     """
     if not headers or not _table_exists(con, "ItemTable"):
-        return 0
+        return 0, 0
     added = 0
+    missing_row = 0
     for item in headers:
         item_key = str(item.get("item_key") or "")
         header = item.get("header")
@@ -2163,9 +2213,11 @@ def _restore_mirror_headers(con: sqlite3.Connection, headers: List[dict]) -> int
             "SELECT value FROM ItemTable WHERE key=?", (item_key,)
         ).fetchone()
         if row is None:
+            missing_row += 1
             continue
         data = _decode_json(row[0])
         if not isinstance(data, dict):
+            missing_row += 1
             continue
         container_key = next(
             (
@@ -2175,6 +2227,7 @@ def _restore_mirror_headers(con: sqlite3.Connection, headers: List[dict]) -> int
             None,
         )
         if container_key is None:
+            missing_row += 1
             continue
         exists = any(
             isinstance(h, dict) and _header_id(h.get("composerId") or h.get("composerID")) == cid
@@ -2183,7 +2236,7 @@ def _restore_mirror_headers(con: sqlite3.Connection, headers: List[dict]) -> int
         if exists:
             continue
         data[container_key].append(dict(header))
-        serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        serialized = _utf8_safe(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
         original_value = row[0]
         if isinstance(original_value, str):
             payload = serialized
@@ -2194,7 +2247,7 @@ def _restore_mirror_headers(con: sqlite3.Connection, headers: List[dict]) -> int
             (payload, item_key),
         )
         added += 1
-    return added
+    return added, missing_row
 
 
 def restore_sessions(backup_path: str) -> dict:
@@ -2202,23 +2255,31 @@ def restore_sessions(backup_path: str) -> dict:
 
     逐库写回 composerHeaders 行、ItemTable 镜像 header、cursorDiskKV
     键值；已存在的数据一律跳过（不覆盖）。调用方负责 Cursor 退出检查。
+    备份文件无法解析时抛 ValueError（JSONDecodeError 的基类），由 CLI 层
+    转为友好报错；单条记录损坏只跳过该条，不影响同库其它记录。
     """
-    with open(backup_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(backup_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except UnicodeDecodeError as e:
+        raise ValueError(f"备份文件不是有效的 UTF-8 文本: {e}") from e
+    if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+        raise ValueError("备份文件结构不符合预期（缺少 sessions 列表）")
 
     sessions_done: Set[str] = set()
     table_rows = 0
     mirror_added = 0
+    mirror_missing_row = 0
     kv_added = 0
     skipped = 0
 
     # 按库分组，一次连接写一个库，避免反复开关连接。
     by_db: Dict[str, List[dict]] = {}
     for record in data.get("sessions", []):
-        by_db.setdefault(record.get("db", ""), []).append(record)
+        by_db.setdefault(record.get("db", "") if isinstance(record, dict) else "", []).append(record)
 
     for db_path, records in by_db.items():
-        if not os.path.isfile(db_path):
+        if not db_path or not os.path.isfile(db_path):
             skipped += len(records)
             continue
         try:
@@ -2227,16 +2288,26 @@ def restore_sessions(backup_path: str) -> dict:
             skipped += len(records)
             continue
         try:
+            # 手动事务 + 逐记录 SAVEPOINT：此前任一条失败 con.rollback()
+            # 会连带回滚同库此前已写入的记录，但计数不回退，统计虚报
+            # "已恢复"而实际未落库（随后清理备份即数据丢失）。
+            con.isolation_level = None
+            con.execute("BEGIN IMMEDIATE")
             for record in records:
-                cid = str(record.get("composer_id") or "")
+                cid = str(record.get("composer_id") or "") if isinstance(record, dict) else ""
                 if not cid:
                     skipped += 1
                     continue
+                con.execute("SAVEPOINT restore_record")
                 try:
                     table_row = record.get("table_row")
                     if isinstance(table_row, dict) and _restore_table_row(con, cid, table_row):
                         table_rows += 1
-                    mirror_added += _restore_mirror_headers(con, record.get("mirror_headers") or [])
+                    db_mirror, db_missing = _restore_mirror_headers(
+                        con, record.get("mirror_headers") or []
+                    )
+                    mirror_added += db_mirror
+                    mirror_missing_row += db_missing
                     for key, encoded in record.get("kv") or []:
                         if not isinstance(key, str) or not isinstance(encoded, dict):
                             continue
@@ -2252,12 +2323,22 @@ def restore_sessions(backup_path: str) -> dict:
                             (key, _decode_backup_value(encoded)),
                         )
                         kv_added += 1
+                    con.execute("RELEASE restore_record")
                     sessions_done.add(cid)
-                except sqlite3.DatabaseError:
-                    con.rollback()
+                except (sqlite3.DatabaseError, ValueError, TypeError):
+                    # 损坏/畸形记录：只回滚该条，统计计入 skipped。
+                    con.execute("ROLLBACK TO restore_record")
+                    con.execute("RELEASE restore_record")
                     skipped += 1
                     continue
-            con.commit()
+            con.execute("COMMIT")
+        except sqlite3.Error:
+            # 整库级失败（锁/IO）：回滚本库，如实计入 skipped。
+            try:
+                con.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            skipped += len(records)
         finally:
             con.close()
 
@@ -2265,6 +2346,7 @@ def restore_sessions(backup_path: str) -> dict:
         "sessions": len(sessions_done),
         "table_rows": table_rows,
         "mirror_added": mirror_added,
+        "mirror_missing_row": mirror_missing_row,
         "kv_added": kv_added,
         "skipped": skipped,
     }
@@ -2272,39 +2354,63 @@ def restore_sessions(backup_path: str) -> dict:
 
 def delete_sessions(sessions: List[Session], vacuum: bool = True) -> dict:
     """
-    删除指定会话：表行 + 镜像条目 + 正文键，单事务提交。
+    删除指定会话：表行 + 镜像条目 + 正文键，逐库事务提交。
     vacuum=True 时随后压缩数据库；大库上这一步可能耗时数分钟。
-    返回统计信息。本函数不自动备份；需要留档时请先调用
-    backup_sessions() 备份勾选会话。
+    返回统计信息；skipped_dbs/errors 如实记录打不开或删除失败的库，
+    调用方必须向用户呈现，不得静默。本函数不自动备份；需要留档时请
+    先调用 backup_sessions() 备份勾选会话。
     """
     ids = {s.composer_id for s in sessions}
     table_del = 0
     mirror_before = 0
     mirror_after = 0
     keys_del = 0
+    skipped_dbs: List[str] = []
+    errors: List[str] = []
 
     for db_path in database_paths():
         try:
             con = open_db_rw(db_path)
-        except sqlite3.Error:
+        except sqlite3.Error as e:
+            # 锁库/只读：该库一行未删，必须如实记录而不是照常报"假成功"。
+            skipped_dbs.append(db_path)
+            errors.append(f"{os.path.basename(db_path)}: 打开失败，未删除（{e}）")
             continue
         try:
             cur = con.cursor()
+            db_table_del = 0
             if ids and _table_exists(con, "composerHeaders"):
-                placeholders = ",".join("?" * len(ids))
-                cur.execute(f"DELETE FROM composerHeaders WHERE composerId IN ({placeholders})", list(ids))
-                db_table_del = max(cur.rowcount, 0)
-            else:
-                db_table_del = 0
-            table_del += db_table_del
+                # 分批删除：SQLite 变量上限 32766（老版本 999），
+                # 全量单发 IN 在大量会话时抛 "too many SQL variables"。
+                id_list = list(ids)
+                for i in range(0, len(id_list), 500):
+                    batch = id_list[i:i + 500]
+                    placeholders = ",".join("?" * len(batch))
+                    cur.execute(
+                        f"DELETE FROM composerHeaders WHERE composerId IN ({placeholders})",
+                        batch,
+                    )
+                    db_table_del += max(cur.rowcount, 0)
             before, after = rewrite_mirror(con, ids)
-            mirror_before += before
-            mirror_after += after
             db_keys_del = 0
             for cid in ids:
                 db_keys_del += remove_keys_for(con, cid)
-            keys_del += db_keys_del
             con.commit()
+        except sqlite3.Error as e:
+            # 单库失败：整体回滚该库（避免"表行已删、镜像/正文残留"的
+            # 半状态），记录错误后继续处理其余库；统计只累计成功提交的库。
+            try:
+                con.rollback()
+            except sqlite3.Error:
+                pass
+            skipped_dbs.append(db_path)
+            errors.append(f"{os.path.basename(db_path)}: 删除失败，已回滚（{e}）")
+            continue
+        else:
+            table_del += db_table_del
+            mirror_before += before
+            mirror_after += after
+            keys_del += db_keys_del
 
             # workspaceStorage 中有些 state.vscdb 没有会话表，避免无意义
             # VACUUM；失败也不影响已提交的删除。TUI 默认把 VACUUM 留给
@@ -2324,6 +2430,8 @@ def delete_sessions(sessions: List[Session], vacuum: bool = True) -> dict:
         "table_rows": table_del,
         "mirror": (mirror_before, mirror_after),
         "keys": keys_del,
+        "skipped_dbs": skipped_dbs,
+        "errors": errors,
     }
 
 
@@ -2350,13 +2458,17 @@ def _as_local_datetime(value: Any) -> Optional[datetime]:
             except ValueError:
                 return None
             # 无时区的旧记录按当前机器本地时间解释；带 Z/offset 的
-            # Cursor 记录统一转换到当前机器本地时区。
-            return parsed.astimezone() if parsed.tzinfo is not None else parsed.astimezone()
+            # Cursor 记录统一转换到当前机器本地时区（astimezone 对
+            # naive 值即按本地时区处理，两种情况同一调用覆盖）。
+            return parsed.astimezone()
 
     if numeric is None:
         return None
     magnitude = abs(numeric)
-    if magnitude >= 1e14:
+    if magnitude >= 1e17:
+        # 纳秒：此前会除成 1e11 秒导致 fromtimestamp 溢出、时间列全空。
+        seconds = numeric / 1_000_000_000
+    elif magnitude >= 1e14:
         seconds = numeric / 1_000_000
     elif magnitude >= 1e11:
         seconds = numeric / 1_000
@@ -2528,7 +2640,23 @@ def scan_orphan_transcripts(sessions: Optional[List[Session]] = None) -> List[di
     """扫描已无对应会话的孤儿转录目录（删除会话后 Cursor 不会清理文件）。
 
     返回 [{"slug", "path", "id", "bytes"}, ...]，按路径排序。
+    任一会话数据库不可读时抛 PermissionError 而不是继续：scan() 对打不
+    开的库静默跳过，缺失会话的转录目录会被误判为孤儿并移进回收站。
     """
+    for path in database_paths():
+        try:
+            con = open_db_ro(path)
+            try:
+                # 连接成功不代表文件完好（损坏文件首条查询才暴露），
+                # 必须实际读一次 schema 确认可用。
+                con.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            raise PermissionError(
+                f"会话数据库当前不可读（{os.path.basename(path)}: {e}），"
+                "无法可靠判定孤儿转录；请完全退出 Cursor 或修复该数据库后重试。"
+            ) from e
     if sessions is None:
         sessions = scan(include_hidden=True)
     alive = {s.composer_id.lower() for s in sessions}
@@ -2545,12 +2673,17 @@ def scan_orphan_transcripts(sessions: Optional[List[Session]] = None) -> List[di
 
 
 def empty_transcript_trash() -> int:
-    """永久清空转录回收站，返回释放的字节数。目录不存在视为 0。"""
+    """永久清空转录回收站，返回实际释放的字节数。目录不存在视为 0。
+
+    按删除后仍存在的条目计算：ignore_errors=True 时部分文件被占用
+    删不掉，按删除前总量汇报会虚报释放空间。
+    """
     if not os.path.isdir(TRANSCRIPT_TRASH_DIR):
         return 0
-    total = _dir_size(TRANSCRIPT_TRASH_DIR)
+    before = _dir_size(TRANSCRIPT_TRASH_DIR)
     shutil.rmtree(TRANSCRIPT_TRASH_DIR, ignore_errors=True)
-    return total
+    remaining = _dir_size(TRANSCRIPT_TRASH_DIR) if os.path.isdir(TRANSCRIPT_TRASH_DIR) else 0
+    return max(before - remaining, 0)
 
 
 def print_report(classes: Dict[str, List[Session]]):
@@ -2596,13 +2729,17 @@ def op_delete_archived(args):
         print(f"级联校验: 转录目录 {t_cnt} 处（{_fmt_bytes(t_bytes)}）将移入 transcript-trash 回收站"
               + (f"；第三方副本 {a_cnt} 处将一并移入" if args.include_assistant else ""))
     if not args.yes:
-        if input("确认删除？[y/N] ").strip().lower() != "y":
+        if not _confirm_prompt("确认删除？[y/N] "):
             print("已取消。")
             return
     require_closed(args.force)
     stats = delete_sessions(targets)
     print(f"完成: 会话 {stats['sessions']}，表行 {stats['table_rows']}，"
           f"镜像 {stats['mirror'][0]} -> {stats['mirror'][1]}，正文键 {stats['keys']}")
+    for err in stats["errors"][:5]:
+        print(f"  [warn] {err}")
+    if len(stats["errors"]) > 5:
+        print(f"  ... 共 {len(stats['errors'])} 条错误")
     if links is not None:
         moved = move_artifacts_to_trash(links, include_assistant=args.include_assistant)
         print(f"级联: 已移入回收站 {moved['moved']} 处"
@@ -2614,8 +2751,14 @@ def op_delete_archived(args):
 
 def op_clean_transcripts(args):
     """扫描并清理已无对应会话的孤儿转录目录（先校验展示，再移入回收站）。"""
-    sessions = scan(include_hidden=True)
-    orphans = scan_orphan_transcripts(sessions)
+    # 移动文件前才检测 Cursor 运行太晚：孤儿判定本身也要求库可读。
+    require_closed(args.force)
+    try:
+        sessions = scan(include_hidden=True)
+        orphans = scan_orphan_transcripts(sessions)
+    except PermissionError as e:
+        print(f"[err] {e}")
+        return
     if not orphans:
         print("没有孤儿转录目录，无需清理。")
         return
@@ -2639,14 +2782,18 @@ def op_clean_transcripts(args):
         print("[dry-run] 仅展示，未做任何改动。")
         return
     if not args.yes:
-        if input(f"确认把 {len(orphans)} 个孤儿转录目录移入 transcript-trash 回收站？[y/N] ").strip().lower() != "y":
+        if not _confirm_prompt(f"确认把 {len(orphans)} 个孤儿转录目录移入 transcript-trash 回收站？[y/N] "):
             print("已取消。")
             return
-    require_closed(args.force)
-    links = {
-        "transcripts": {o["id"].lower(): [(o["slug"], o["path"], o["bytes"])] for o in orphans},
-        "assistant": {os.path.basename(p).lower(): [(p, b)] for p, b in assistant_dirs},
-    }
+    links: Dict[str, Dict[str, list]] = {"transcripts": {}, "assistant": {}}
+    for o in orphans:
+        # setdefault：不同 slug 下可能存在同名转录目录，dict 推导会
+        # 相互覆盖、只移动最后一个。
+        links["transcripts"].setdefault(
+            o["id"].lower(), []
+        ).append((o["slug"], o["path"], o["bytes"]))
+    for p, b in assistant_dirs:
+        links["assistant"].setdefault(os.path.basename(p).lower(), []).append((p, b))
     moved = move_artifacts_to_trash(links, include_assistant=args.include_assistant)
     print(f"完成: 已移入回收站 {moved['moved']} 处"
           f"（{_fmt_bytes(moved['bytes'])}）"
@@ -2716,12 +2863,20 @@ def op_restore_sessions(args):
             return
         baks = [baks[idx]]
     require_closed(args.force)
-    if not args.yes and input("恢复只写回备份中缺失的数据，不覆盖现有会话，继续？[y/N] ").strip().lower() != "y":
+    if not args.yes and not _confirm_prompt("恢复只写回备份中缺失的数据，不覆盖现有会话，继续？[y/N] "):
         print("已取消。")
         return
-    stats = restore_sessions(baks[0])
+    try:
+        stats = restore_sessions(baks[0])
+    except (OSError, ValueError) as e:
+        print(f"[err] 恢复失败: {e}")
+        print("      备份文件可能损坏（写入中断或被改动），未对数据库做任何修改。")
+        return
     print(f"完成: 恢复会话 {stats['sessions']}，表行 {stats['table_rows']}，"
           f"镜像 {stats['mirror_added']}，正文键 {stats['kv_added']}，跳过已存在 {stats['skipped']}")
+    if stats.get("mirror_missing_row"):
+        print(f"[warn] {stats['mirror_missing_row']} 条镜像条目因目标库缺少对应 "
+              f"ItemTable 行未能恢复（会话正文键已恢复，Cursor 内列表项可能缺失）。")
 
 
 def op_repair_mirror(args):
@@ -2799,6 +2954,15 @@ def require_closed(force: bool):
     if cursor_running() and not force:
         print("[err] Cursor 正在运行，请完全退出后重试（或加 --force 强行执行）")
         sys.exit(1)
+
+
+def _confirm_prompt(prompt: str) -> bool:
+    """交互式 y/N 确认；标准输入被关闭（管道/cron 等非交互环境）时视为取消。"""
+    try:
+        return input(prompt).strip().lower() == "y"
+    except EOFError:
+        print("[err] 标准输入已关闭，无法确认，已取消；非交互环境请加 --yes 跳过确认。")
+        return False
 
 
 # =====================================================================
@@ -2967,8 +3131,10 @@ def run_cleanup(selected: Dict[str, bool]) -> Dict[str, int]:
         removed = 0
         for f in _list_backup_files():
             try:
-                removed += os.path.getsize(f)
+                # 先删后计：remove 失败（文件被占用）不能把字节数算进去。
+                size = os.path.getsize(f)
                 os.remove(f)
+                removed += size
             except OSError:
                 continue
         freed["backups"] = removed
@@ -2977,8 +3143,9 @@ def run_cleanup(selected: Dict[str, bool]) -> Dict[str, int]:
         removed = 0
         for f in _list_search_indexes():
             try:
-                removed += os.path.getsize(f)
+                size = os.path.getsize(f)
                 os.remove(f)
+                removed += size
             except OSError:
                 continue
         freed["search_index"] = removed
@@ -3058,8 +3225,15 @@ def _copy_to_clipboard(text: str) -> bool:
             if not buf:
                 return False
             locked = kernel32.GlobalLock(buf)
-            if locked:
+            if not locked:
+                # 锁不住就拿不到可写内存指针；GHND 含 ZEROINIT，继续
+                # SetClipboardData 会把全零缓冲交给系统，粘贴出来是
+                # 空串却返回"已复制"。
+                kernel32.GlobalFree(buf)
+                return False
+            try:
                 ctypes.memmove(locked, data, len(data))
+            finally:
                 kernel32.GlobalUnlock(buf)
             if not user32.SetClipboardData(13, buf):  # 13 = CF_UNICODETEXT
                 kernel32.GlobalFree(buf)
@@ -3377,6 +3551,15 @@ def _build_app_class(mods):
                     cb.value = key in self._selected
             self._update_status()
 
+        def _enabled_keys(self) -> Set[str]:
+            """当前可勾选（未禁用）的类目 key。禁用规则与 _render_targets
+            一致：需要 Cursor 退出且 Cursor 正在运行的类目。"""
+            running = getattr(self, "_cursor_running", False)
+            return {
+                t["key"] for t in self._targets
+                if not (t.get("requires_closed") and running)
+            }
+
         def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
             key = (event.checkbox.id or "").removeprefix("ck-")
             if key in {t["key"] for t in self._targets}:
@@ -3389,7 +3572,9 @@ def _build_app_class(mods):
         def on_button_pressed(self, event: Button.Pressed) -> None:
             bid = event.button.id or ""
             if bid == "ck-all":
-                self._selected = {t["key"] for t in self._targets}
+                # 只勾选未禁用的类目：禁用项（如 Cursor 运行中的
+                # VACUUM/缓存）执行时必被拒绝，计入勾选与预览会误导。
+                self._selected = self._enabled_keys()
                 self._sync_checkboxes()
             elif bid == "ck-none":
                 self._selected.clear()
@@ -3420,7 +3605,9 @@ def _build_app_class(mods):
             if not result:
                 self.notify("已取消", timeout=2)
                 return
-            if self._selected & CLEANUP_NEEDS_CLOSED and cursor_running():
+            # 缓存版检测：确认回调在 UI 线程，无缓存版会 spawn tasklist
+            # 子进程（Windows 下 0.5~2s，超时 15s），拖住整个事件循环。
+            if self._selected & CLEANUP_NEEDS_CLOSED and cursor_running_cached():
                 self.notify("所选类目需要 Cursor 完全退出才能清理", severity="error", timeout=5)
                 return
             chosen = {key: True for key in self._selected}
@@ -3505,6 +3692,10 @@ def _build_app_class(mods):
             """替换排版结果（resize 后由 worker 重建调用）。"""
             self._layout = layout
             self.virtual_size = Size(layout.width, layout.total_lines)
+            # 行号随折行变化，旧选区的视口相对坐标会指向别的文本，
+            # 直接清除避免复制出错位内容。
+            self._sel_anchor = None
+            self._sel_focus = None
             self.refresh()
 
         def on_mount(self) -> None:
@@ -3546,8 +3737,12 @@ def _build_app_class(mods):
                 if layout is not None and layout.width != self._layout.width:
                     self.set_layout(layout)
                 self._rebuild_worker = None
+                # 重建进行中到达的 resize 请求此前被 _schedule_rebuild
+                # 直接丢弃，布局会停在中间宽度；完成后按当前宽度复查补排。
+                self._check_width()
             elif event.state in (WorkerState.ERROR, WorkerState.CANCELLED):
                 self._rebuild_worker = None
+                self._check_width()
 
         # ---- 文本选择（自定义 render 必须自行实现；坐标为视口相对 cell） ----
 
@@ -3704,19 +3899,30 @@ def _build_app_class(mods):
             self.virtual_size = Size(3, n * 2 - 1 if n else 1)
 
         def render(self) -> RenderResult:
-            lines: List[str] = []
+            # 虚拟化渲染：只生成视口内的行，按 scroll_y 偏移。此前
+            # render() 恒输出整条圆点链（不带偏移），消息多到超过轨道
+            # 高度时后面的圆点永远不可见；而 _dot_index_at 按
+            # scroll_y 换算索引，滚轮滚动后点击/悬停会跳到错误的圆点。
+            from rich.console import Group
+            from rich.text import Text
+
             n = len(self._user_msgs)
-            for i in range(n):
-                if i == self._hovered:
-                    dot = "[b $accent reverse]●[/]"
-                elif i == self._current:
-                    dot = "[b $primary]●[/]"
+            total = max(1, n * 2 - 1)
+            height = max(1, self.size.height)
+            sy = min(int(self.scroll_y), max(0, total - 1))
+            lines: List[Text] = []
+            for row in range(sy, min(sy + height, total)):
+                if row % 2 == 0:
+                    i = row // 2
+                    if i == self._hovered:
+                        lines.append(Text("  ●", style="b $accent reverse"))
+                    elif i == self._current:
+                        lines.append(Text("  ●", style="b $primary"))
+                    else:
+                        lines.append(Text("  ●"))
                 else:
-                    dot = "●"
-                lines.append(f"  {dot}")
-                if i < n - 1:
-                    lines.append("  ┆")
-            return "\n".join(lines)
+                    lines.append(Text("  ┆"))
+            return Group(*lines)
 
         def set_current(self, index: int) -> None:
             """由 ChatScreen 在正文滚动时调用，高亮视口内圆点。"""
@@ -4000,6 +4206,14 @@ def _build_app_class(mods):
             self._chat_title: Optional[str] = None
             self._backup_worker: Optional[Worker] = None
             self._delete_worker: Optional[Worker] = None
+            self._scan_worker: Optional[Worker] = None
+            self._scan_context: Tuple[Optional[str], Tuple[Tuple[Any, ...], ...]] = (None, ())
+
+        def notify(self, message, *, title="", severity="information", timeout=None, markup=False):
+            """Toast 默认不解析 markup：文案常含用户可控文本（会话名/查询词/
+            异常信息），形如 [/] 的内容被当作标签解析会让 Toast 渲染崩溃。"""
+            super().notify(message, title=title, severity=severity,
+                           timeout=timeout, markup=markup)
 
         def compose(self) -> ComposeResult:
             yield NoToggleHeader(show_clock=True)
@@ -4047,7 +4261,7 @@ def _build_app_class(mods):
         def refresh_data_quiet(self) -> None:
             # 删除/VACUUM 过程中数据库会持续变化；此时扫描不仅没有意义，
             # 还可能在主线程撞上写入锁。
-            if self._delete_worker is not None:
+            if self._delete_worker is not None or self._scan_worker is not None:
                 return
             # 数据库文件没有变化时直接跳过，避免每 5 秒全量 scan()。
             try:
@@ -4056,13 +4270,54 @@ def _build_app_class(mods):
                 fp = None
             if fp is not None and fp == self._last_fingerprint:
                 return
-            self.refresh_data(quiet=True)
+            # Cursor 运行时指纹几乎每 5 秒必变；全量 scan() 要拉取所有
+            # cursorDiskKV 大 blob，同步执行会周期性冻结事件循环，
+            # 因此放到后台线程，完成后在 worker 回调里应用结果。
+            self._scan_context = (
+                self.row_to_id.get(self.current_row) if self.current_row else None,
+                self._session_signature(self.sessions),
+            )
+            self._scan_worker = self.run_worker(scan, thread=True, exit_on_error=False)
+
+        def _finish_scan_worker(self, worker: "Worker") -> None:
+            self._scan_worker = None
+            if worker.state == WorkerState.SUCCESS:
+                current_id, old_signature = self._scan_context or (None, ())
+                self._apply_scan(worker.result, current_id, old_signature)
+            elif worker.state == WorkerState.ERROR:
+                error_text = str(worker.error or "")
+                if error_text != self._last_scan_error:
+                    self.notify(f"扫描失败: {error_text}", severity="error", timeout=5)
+                self._last_scan_error = error_text
+                # 失败不更新指纹，下次定时重试。
 
         def refresh_data(self, quiet: bool = False, force: bool = False) -> bool:
+            # 用户主动刷新与后台静默扫描并发时，以后者丢弃为准：先取消
+            # 在途的静默扫描，避免其过期结果覆盖本次扫描。
+            if self._scan_worker is not None:
+                self._scan_worker.cancel()
+                self._scan_worker = None
             current_id = self.row_to_id.get(self.current_row) if self.current_row else None
             old_signature = self._session_signature(self.sessions)
             try:
                 new_sessions = scan()
+            except Exception as e:
+                error_text = str(e)
+                if not quiet or error_text != self._last_scan_error:
+                    self.notify(f"扫描失败: {error_text}", severity="error", timeout=5)
+                self._last_scan_error = error_text
+                # 定时刷新遇到 Cursor 短暂锁库时保留旧列表，不要闪烁成空表。
+                return False
+            return self._apply_scan(new_sessions, current_id, old_signature, force=force)
+
+        def _apply_scan(
+            self,
+            new_sessions: List[Session],
+            current_id: Optional[str],
+            old_signature: Tuple[Tuple[Any, ...], ...],
+            force: bool = False,
+        ) -> bool:
+            try:
                 new_signature = self._session_signature(new_sessions)
                 # scan 成功后同步指纹，供定时刷新短路；失败路径不更新，
                 # 保留旧指纹以便下次定时重试。
@@ -4083,10 +4338,9 @@ def _build_app_class(mods):
                 self._last_scan_error = None
             except Exception as e:
                 error_text = str(e)
-                if not quiet or error_text != self._last_scan_error:
+                if error_text != self._last_scan_error:
                     self.notify(f"扫描失败: {error_text}", severity="error", timeout=5)
                 self._last_scan_error = error_text
-                # 定时刷新遇到 Cursor 短暂锁库时保留旧列表，不要闪烁成空表。
                 return False
             self.rebuild_table(preserve_id=current_id)
             self.set_filter_buttons()
@@ -4111,7 +4365,9 @@ def _build_app_class(mods):
                 row_key = table.add_row(
                     "☑" if s.composer_id in self.selected else "☐",
                     STATUS_LABEL[s.status],
-                    s.display_name,
+                    # 标题来自会话数据，可能含 [/] 等 markup 序列；
+                    # DataTable 默认解析 markup，不转义会 MarkupError 闪退。
+                    _md_escape(s.display_name),
                     str(s.content_keys),
                     fmt_ts(s.last_updated),
                     s.composer_id[:13],
@@ -4367,9 +4623,10 @@ def _build_app_class(mods):
             self.refresh_data()
 
         def action_view_chat(self) -> None:
-            # v 是 CleanerApp 的全局快捷键。打开聊天记录后，按键事件仍
-            # 可能到达这里；此时直接忽略，避免重复压入 ChatScreen。
-            if isinstance(self.screen, ChatScreen):
+            # v 是 CleanerApp 的全局快捷键。聊天页/清理面板在台上时按键
+            # 仍可能到达这里；此时直接忽略，避免重复压入 ChatScreen 或
+            # 把聊天页叠在清理面板之上。
+            if isinstance(self.screen, (ChatScreen, CleanupScreen)):
                 return
             if not self.current_row:
                 self.notify("先选中一行再查看（↑↓ 移动高亮）", timeout=3)
@@ -4398,10 +4655,14 @@ def _build_app_class(mods):
 
         @on(Worker.StateChanged)
         def on_worker_state_changed(self, event: "Worker.StateChanged") -> None:
-            """聊天详情/备份 worker 结束时在主线程处理结果。"""
+            """聊天详情/备份/静默扫描 worker 结束时在主线程处理结果。"""
             if event.worker is self._delete_worker:
                 if event.state in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
                     self._finish_delete_worker(event.worker)
+                return
+            if event.worker is self._scan_worker:
+                if event.state in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
+                    self._finish_scan_worker(event.worker)
                 return
             if event.worker is self._backup_worker:
                 if event.state == WorkerState.SUCCESS:
@@ -4426,10 +4687,16 @@ def _build_app_class(mods):
                 title = self._chat_title or ""
                 self._chat_worker = None
                 self._chat_title = None
-                if self.screen is not None:
+                if self.screen is not None and not isinstance(
+                    self.screen, (ChatScreen, CleanupScreen)
+                ):
                     msgs, layout = worker.result or ([], None)
                     if layout is not None:
                         self.push_screen(ChatScreen(title, msgs, layout))
+                elif isinstance(self.screen, CleanupScreen):
+                    # 加载期间按 X 打开了清理面板：聊天页压在面板之上会
+                    # 打乱返回顺序，丢弃本次结果并提示，不静默。
+                    self.notify("聊天记录已加载；关闭清理面板后按 V 重新查看", timeout=5)
             elif event.state == WorkerState.ERROR:
                 worker = self._chat_worker
                 self._chat_worker = None
@@ -4518,7 +4785,8 @@ def _build_app_class(mods):
                 if not confirmed:
                     self.notify("已取消", timeout=2)
                     return
-                if cursor_running():
+                # 同上：UI 线程用缓存版检测，避免 tasklist 子进程阻塞。
+                if cursor_running_cached():
                     self.notify("Cursor 正在运行！请先完全退出再删除。", severity="error", timeout=5)
                     return
                 include_assistant = bool(options.get("assistant"))
@@ -4566,6 +4834,17 @@ def _build_app_class(mods):
                 if cascade.get("errors"):
                     for err in cascade["errors"][:3]:
                         self.notify(f"级联失败: {err}", severity="warning", timeout=8)
+                # 逐库错误必须呈现：锁库/IO 失败的库一行未删，静默会
+                # 让用户误以为已全部清理干净。
+                if stats.get("errors"):
+                    self.notify(
+                        f"有 {len(stats['skipped_dbs'])} 个数据库未完成删除，"
+                        f"请关闭 Cursor 后重试",
+                        severity="error",
+                        timeout=8,
+                    )
+                    for err in stats["errors"][:3]:
+                        self.notify(f"删除失败: {err}", severity="warning", timeout=8)
             else:
                 self.notify(f"删除失败: {worker.error}", severity="error", timeout=8)
 
