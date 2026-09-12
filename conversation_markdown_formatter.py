@@ -58,12 +58,17 @@ def _as_local_datetime(value: Any) -> Optional[datetime]:
                 parsed = datetime.fromisoformat(iso_text)
             except ValueError:
                 return None
-            return parsed.astimezone() if parsed.tzinfo is not None else parsed.astimezone()
+            # 无时区按本地解释；带 Z/offset 的转本地时区——astimezone
+            # 对 naive 值即按本地时区处理，两种情况同一调用覆盖。
+            return parsed.astimezone()
 
     if numeric is None:
         return None
     magnitude = abs(numeric)
-    if magnitude >= 1e14:
+    if magnitude >= 1e17:
+        # 纳秒：此前会除成 1e11 秒导致 fromtimestamp 溢出、时间列全空。
+        seconds = numeric / 1_000_000_000
+    elif magnitude >= 1e14:
         seconds = numeric / 1_000_000
     elif magnitude >= 1e11:
         seconds = numeric / 1_000
@@ -147,7 +152,8 @@ def _lower_headings(line: str) -> str:
     """
     stripped = line.lstrip()
     hashes = len(stripped) - len(stripped.lstrip("#"))
-    if 0 < hashes < 3 and stripped[hashes:hashes + 1] in (" ", ""):
+    # CommonMark 允许 # 与标题文字之间用制表符分隔
+    if 0 < hashes < 3 and stripped[hashes:hashes + 1] in (" ", "\t", ""):
         return "#" * (hashes + 2) + stripped[hashes:]
     return line
 
@@ -195,6 +201,7 @@ def _format_message_body(text: str) -> str:
 
     # 代码块状态机：fence 长度由内容决定，先扫描后重写
     fence_len = 0          # 0=不在代码块内，否则为当前围栏长度
+    fence_char = "`"       # 当前围栏字符（开启行决定）
     fence_lang = ""
     code_lines: List[str] = []
     out: List[str] = []
@@ -209,18 +216,27 @@ def _format_message_body(text: str) -> str:
         line = raw_lines[i]
         stripped = line.lstrip()
         if fence_len == 0:
-            # 尝试开启代码块：行首 >=3 个反引号
+            # 尝试开启代码块：行首 >=3 个反引号或波浪线
             if stripped.startswith("```") or stripped.startswith("~~~"):
                 marker = "`" if stripped.startswith("```") else "~"
                 count = len(stripped) - len(stripped.lstrip(marker))
                 if count >= 3:
                     fence_len = count
+                    fence_char = marker
                     fence_lang = stripped[count:].strip()
                     i += 1
                     continue
             out.append(_lower_headings(line))
         else:
-            if stripped.startswith("`" * fence_len) or stripped.startswith("~" * fence_len):
+            # 关闭围栏（CommonMark）：必须与开启行同字符、长度不短于
+            # 开启围栏，且其后不得有 info string。此前不区分字符种类，
+            # ``` 围栏会被内容中的 ~~~ 行提前"关闭"，整块代码内容
+            # 丢失；````python 这类嵌套开启行也会被误当关闭行吞掉。
+            rest = stripped[fence_len:]
+            if (
+                stripped.startswith(fence_char * fence_len)
+                and all(ch == fence_char or ch in (" ", "\t") for ch in rest)
+            ):
                 flush_code()
                 fence_len = 0
                 fence_lang = ""
@@ -248,6 +264,16 @@ def _format_message_body(text: str) -> str:
     return "\n".join(_split_long_paragraphs(collapsed)).rstrip()
 
 
+def _inline_code(text: str) -> str:
+    """把单行文本包成行内代码 span；含反引号时按 CommonMark 规则用
+    更长的反引号串并在必要处加空格填充，防止内容提前闭合 span。"""
+    longest = _longest_backtick_run(text)
+    fence = "`" * max(1, longest + 1)
+    if longest and (text.startswith("`") or text.endswith("`")):
+        text = f" {text} "
+    return f"{fence}{text}{fence}"
+
+
 def _format_tools(tools: List[dict]) -> List[str]:
     """工具调用摘要 -> 引用块行（内容不截断，供归档）。"""
     lines: List[str] = []
@@ -258,9 +284,13 @@ def _format_tools(tools: List[dict]) -> List[str]:
         status = tool.get("status")
         head = f"> 🔧 {name}" + (f" [{status}]" if status else "")
         lines.append(head)
-        detail = tool.get("detail") or ""
+        detail = str(tool.get("detail") or "")
         if detail:
-            lines.append(f"> `{detail}`")
+            # 行内代码不能跨行，含反引号的内容需要加长定界符；
+            # 此前直接 `detail` 一把包，命令参数里的反引号会把
+            # code span 截成三段，破坏引用块结构。
+            for dl in detail.replace("\r\n", "\n").split("\n"):
+                lines.append(f"> {_inline_code(dl)}")
     return lines
 
 
@@ -285,7 +315,12 @@ def format_message(message: Any, index: int) -> str:
     if body:
         parts.append(body)
     if m["thinking"]:
-        parts.append(f"> 💭 思考: {m['thinking']}")
+        # 多行 thinking 逐行加引用前缀：直接拼接会让第二行逃出
+        # 引用块，破坏文档层级。
+        thinking_lines = m["thinking"].replace("\r\n", "\n").split("\n")
+        parts.append("> 💭 思考: " + thinking_lines[0])
+        for extra in thinking_lines[1:]:
+            parts.append(("> " + extra).rstrip())
     if m["tools"]:
         parts.extend(_format_tools(m["tools"]))
     if len(parts) == 1:
@@ -332,7 +367,11 @@ def build_markdown_document(title: str, msgs: List[dict]) -> str:
     右侧的一个圆点）直接作为二级标题分组，其后的助手消息以三级
     标题归入该分组，直到下一条用户消息。
     """
-    title = (title or "").strip() or "对话记录"
+    raw_title = (title or "").strip() or "对话记录"
+    # 标题来自会话数据，可能含换行或行首 #：只取首行并去掉标题记号，
+    # 防止把文档 H1 拆成多行或注入任意级别的标题。
+    first_line = raw_title.splitlines()[0] if raw_title.splitlines() else ""
+    title = first_line.lstrip("#").strip() or "对话记录"
     parts: List[str] = [f"# {title}", ""]
     parts.append(f"> 对话主题：{title}")
     parts.append("")
